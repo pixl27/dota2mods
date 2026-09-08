@@ -149,11 +149,30 @@ static bool ManualMap(HANDLE proc, const std::vector<uint8_t>& img, uint8_t** ou
     return true;
 }
 
+static void SyncConfigToTemp() {
+    CreateDirectoryA("C:\\Temp", nullptr);
+    CreateDirectoryA("C:\\Temp\\opencode", nullptr);
+    const char* files[] = { "offsets.bin", "gc_hook.txt", "skins_full.json" };
+    const char* alt_prefixes[] = { "", "build/", "data/", "build/data/" };
+    for (auto file : files) {
+        std::string dest = std::string("C:\\Temp\\opencode\\") + file;
+        for (auto pfx : alt_prefixes) {
+            std::string src = std::string(pfx) + file;
+            if (CopyFileA(src.c_str(), dest.c_str(), FALSE)) {
+                std::cout << "[*] Synced " << src << " -> " << dest << "\n";
+                break;
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const char* dll = (argc > 1) ? argv[1] : "wardrobe_dll.dll";
     std::ifstream f(dll, std::ios::binary);
     if (!f) { std::cout << "[!] can't open " << dll << "\n"; return 1; }
     std::vector<uint8_t> img((std::istreambuf_iterator<char>(f)), {});
+
+    SyncConfigToTemp();
 
     DWORD pid = FindPid("dota2.exe");
     if (!pid) { std::cout << "[!] start Dota 2 first, then run map.exe.\n"; return 1; }

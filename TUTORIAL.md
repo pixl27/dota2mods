@@ -198,7 +198,89 @@ If you prefer an in-game status HUD and automatic re-application on death/respaw
 
 ---
 
-## 4. Stealth & Security Features Implemented
+## 4. Level 3: GC Inventory Unlock (Dota 2 Native Armory Unlock)
+
+Level 3 operates at the Steam economy network layer rather than the in-match 3D entity layer.
+
+Instead of swapping models one by one, Level 3 intercepts incoming **Game Coordinator (GC)** network packets from Valve's servers and dynamically injects ~12,000 fake `CSOEconItem` records (generated from `data/skins_full.json`) into your local inventory cache (`CMsgSOCacheSubscribed`).
+
+As a result, **Dota 2's official main-menu Armory, Hero loadout screens, and pre-game pick phases treat all cosmetics as owned by your account.**
+
+> [!CAUTION]
+> **Account Safety Notice**: Level 3 tampers with the client-side representation of the Steam economy. While client-side, official Valve ranked servers verify item ownership when loading into a match. If an equipped item is not owned on Steam, the server may reset it or flag the mismatch. **Use Level 3 exclusively for offline practice, bot matches, local lobbies, or on disposable smurf accounts.**
+
+---
+
+### 4.1 How It Works Under the Hood
+
+1. When Dota 2 connects to the Steam network, the Game Coordinator transmits `k_EMsgGCClientWelcome` and `CMsgSOCacheSubscribed`.
+2. Inside `client.dll`, a dispatch handler receives this buffer:
+   ```protobuf
+   message CMsgSOCacheSubscribed {
+       repeated CMsgSOSingleObject objects = 2;
+   }
+   ```
+3. In [`src/inventory.cpp`](file:///c:/Users/Mahery/Documents/GitHub/rider_register_flutter-main/dota2mods/src/inventory.cpp), Wardrobe pre-compiles `g_InjectBlob`: a serialized array of `CMsgSOSingleObject` records where each item has `type_id = 1` (econ item) and points to a serialized `CSOEconItem` containing the skin's `def_index`, rarity, and quality.
+4. When `hkOnCache` hooks the dispatch function, it appends `g_InjectBlob` to the incoming packet and passes the extended buffer to Dota's original parser.
+5. Dota 2 parses your real inventory plus all 12,000 injected skins.
+
+---
+
+### 4.2 How to Find the GC Hook RVA (`gc_hook.txt`)
+
+To enable Level 3, you need the RVA (Relative Virtual Address) of the GC cache dispatch function in `client.dll`.
+
+#### Step-by-step in IDA Pro or Ghidra:
+1. Open `<Steam>\steamapps\common\dota 2 beta\game\bin\win64\client.dll` in IDA Pro or Ghidra.
+2. Press <kbd>Shift</kbd> + <kbd>F12</kbd> (Strings) and search for:
+   ```
+   "SOCacheSubscribed"
+   ```
+3. Double-click the string and press <kbd>X</kbd> to find cross-references (xrefs).
+4. The string is passed to an event registration function or used inside `CGCClient::OnSOCacheSubscribed`.
+5. Follow the callers up 2 to 3 levels to locate the top-level GC message router (typically `CGCClient::HandleMessage` or `CDOTAGCClient::OnMessage`, which contains a large `switch` statement on message types like `k_EMsgGCClientWelcome`).
+6. Identify the function entry point.
+7. Calculate the **RVA**:
+   $$\text{RVA} = \text{Function Address} - \text{client.dll Image Base}$$
+8. Convert this RVA to hexadecimal (e.g., `0x1A2B3C4` $\to$ `1A2B3C4`).
+
+---
+
+### 4.3 Setting Up `gc_hook.txt`
+
+Save your hexadecimal RVA into a file named `gc_hook.txt`:
+
+```powershell
+echo 1A2B3C4 > build\gc_hook.txt
+```
+*(Also copy `gc_hook.txt` to `C:\Temp\opencode\gc_hook.txt` if using the fallback path).*
+
+Ensure the skin database is present next to the DLL:
+```powershell
+copy data\skins_full.json build\data\skins_full.json
+```
+
+---
+
+### 4.4 Running Level 3
+
+1. Start **Dota 2** and wait until the game reaches the main menu loading screen.
+2. Open an administrator PowerShell / Command Prompt and map the payload:
+   ```powershell
+   build\map.exe build\wardrobe_dll.dll
+   ```
+3. Open Dota 2 and press <kbd>INSERT</kbd>.
+4. The live status menu will show:
+   ```
+   status: live | inv unlock: 12480 items
+   ```
+5. Navigate to **Heroes** $\to$ **Armory** in the official Dota 2 menu:
+   - All Arcanas, Immortals, taunts, couriers, and personas are unlocked.
+   - You can equip items, change styles, and preview animations directly inside the official game interface.
+
+---
+
+## 5. Stealth & Security Features Implemented
 
 Wardrobe incorporates multiple layers of security to ensure safety during use:
 
@@ -218,7 +300,7 @@ Wardrobe incorporates multiple layers of security to ensure safety during use:
 
 ---
 
-## 5. Troubleshooting & FAQ
+## 6. Troubleshooting & FAQ
 
 ### Q: The overlay does not appear over Dota 2.
 - Ensure Dota 2 is running in **"Borderless Windowed"** or **"Windowed"** mode (Settings $\to$ Video $\to$ Display Mode). Exclusive Fullscreen windows block transparent layered desktop overlays.

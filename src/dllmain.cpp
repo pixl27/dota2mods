@@ -266,7 +266,7 @@ static HRESULT __stdcall hkPresent(IDXGISwapChain* ch, UINT s, UINT f) {
 
 static bool LoadOffsets() {
     // loader drops offsets.bin next to the game or passes path via registry-free env
-    const char* paths[] = { "offsets.bin", "C:\\Temp\\opencode\\offsets.bin" };
+    const char* paths[] = { "offsets.bin", "build/offsets.bin", "C:\\Temp\\opencode\\offsets.bin" };
     for (auto p : paths) {
         FILE* f = nullptr;
         fopen_s(&f, p, "rb");
@@ -326,8 +326,11 @@ DWORD WINAPI MainThread(LPVOID mod) {
     // writer still works. Safest default.
     {
         FILE* gf = nullptr;
-        fopen_s(&gf, "gc_hook.txt", "rb");
-        if (!gf) fopen_s(&gf, "C:\\Temp\\opencode\\gc_hook.txt", "rb");
+        const char* gc_paths[] = { "gc_hook.txt", "build/gc_hook.txt", "C:\\Temp\\opencode\\gc_hook.txt" };
+        for (auto gp : gc_paths) {
+            fopen_s(&gf, gp, "rb");
+            if (gf) break;
+        }
         if (gf) {
             char line[64] = {};
             fread(line, 1, sizeof(line) - 1, gf);
