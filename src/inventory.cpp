@@ -115,11 +115,11 @@ size_t InjectItemCount() { return g_InjectCount; }
 
 // Hook target: the GC cache-dispatch fn in client.dll (RVA from gc_hook.txt).
 // We don't parse — we extend the buffer, then call original.
-typedef void(__fastcall* OnCacheFn)(void*, void*, void*, size_t);
+typedef void(__fastcall* OnCacheFn)(void* self, void* msg, size_t len);
 static OnCacheFn oOnCache = nullptr;
 OnCacheFn* GetOnCacheOrigSlot() { return &oOnCache; }
 
-void __fastcall hkOnCache(void* self, void* edx, void* msg, size_t len) {
+void __fastcall hkOnCache(void* self, void* msg, size_t len) {
     std::lock_guard<std::mutex> lk(g_InjectMutex);
     if (!g_InjectBlob.empty() && msg && len > 0 && oOnCache) {
         size_t total = len + g_InjectBlob.size();
@@ -127,10 +127,10 @@ void __fastcall hkOnCache(void* self, void* edx, void* msg, size_t len) {
         if (grown) {
             memcpy(grown, msg, len);
             memcpy(grown + len, g_InjectBlob.data(), g_InjectBlob.size());
-            oOnCache(self, edx, grown, total);
+            oOnCache(self, grown, total);
             free(grown);
             return;
         }
     }
-    if (oOnCache) oOnCache(self, edx, msg, len);
+    if (oOnCache) oOnCache(self, msg, len);
 }

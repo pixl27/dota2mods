@@ -1,0 +1,15 @@
+build/
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.bin
+__pycache__/
+*.pyc
+loadout.json
+gc_hook.txt
+items_game.txt
+items_english.txt

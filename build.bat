@@ -1,13 +1,51 @@
 @echo off
-REM wardrobe/build.bat — double-click this, baby. DLL + EXE + loader, one shot.
-setlocal
+REM wardrobe/build.bat — double-click this. DLL + EXE + loader, one shot.
+setlocal enabledelayedexpansion
 
 where cl >nul 2>nul
 if errorlevel 1 (
-  echo [!] Run this from "x64 Native Tools Command Prompt for VS" — not plain cmd.
-  echo     Start Menu -^> Visual Studio -^> x64 Native Tools Command Prompt, then cd here and run build.bat
-  pause
-  exit /b 1
+    echo [*] cl.exe not in PATH. Searching for Visual Studio vcvars64.bat...
+    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    if exist "!VSWHERE!" (
+        for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+            if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" (
+                echo [*] Found Visual Studio: %%i
+                call "%%i\VC\Auxiliary\Build\vcvars64.bat" >nul
+            )
+        )
+    )
+)
+
+where cl >nul 2>nul
+if errorlevel 1 (
+    for %%p in (
+        "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+        "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+        "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        "%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+        "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
+        "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Professional\VC\Auxiliary\Build\vcvars64.bat"
+        "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    ) do (
+        if exist %%p (
+            echo [*] Found Visual Studio at %%p
+            call %%p >nul
+            goto :found_vs
+        )
+    )
+)
+:found_vs
+
+where cl >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo [!] MSVC compiler (cl.exe) not found.
+    echo     Please install Visual Studio with "Desktop development with C++", or
+    echo     run this script from "x64 Native Tools Command Prompt for VS".
+    echo.
+    pause
+    exit /b 1
 )
 
 if not exist build mkdir build

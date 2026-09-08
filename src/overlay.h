@@ -18,5 +18,6 @@ extern HWND g_Overlay;
 extern bool g_MenuOpen;
 
 void MakeOverlay(HINSTANCE inst);
-void InitDX();
+bool InitDX();
+void CleanupDX();
 void DrawWardrobe();   // defined in browser.cpp

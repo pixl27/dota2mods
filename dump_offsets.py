@@ -1,7 +1,9 @@
-# dump_offsets.py — finds wearable offsets in client.dll, writes offsets.bin
-# needs: pip install pefile
-# usage: python dump_offsets.py "<path to>\client.dll"
-#        (Steam\steamapps\common\dota 2 beta\game\bin\win64\client.dll)
+r"""
+dump_offsets.py — finds wearable offsets in client.dll, writes offsets.bin
+needs: pip install pefile
+usage: python dump_offsets.py "<path to>\client.dll"
+       (Steam\steamapps\common\dota 2 beta\game\bin\win64\client.dll)
+"""
 import struct, sys
 
 if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
@@ -9,15 +11,15 @@ if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
     sys.exit(0)
 
 if sys.argv[1] == "--write":
-    vals = [int(x, 16) for x in sys.argv[2:11]]
+    vals = [int(x, 16) for x in sys.argv[2:10]]
     if len(vals) != 8:
         print("[!] need exactly 8 hex numbers:")
         print("    dwLocalPlayerHero m_hWearables m_ItemView m_iItemDefIndex")
         print("    m_nFallbackPaint m_bNeedReapply dwEntityList fnFullUpdate")
         sys.exit(1)
-    blob = struct.pack("<II9Q",
+    blob = struct.pack("<II8Q",
         0x57415244, 1,
-        vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], 0)
+        vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7])
     open("offsets.bin", "wb").write(blob)
     print("[OK] offsets.bin written. Copy it next to wardrobe_dll.dll and to C:\\Temp\\opencode\\")
     sys.exit(0)

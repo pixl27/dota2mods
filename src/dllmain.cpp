@@ -20,8 +20,8 @@
 // inventory.cpp — GC inventory unlock (Dota's own loadout UI shows everything)
 void BuildInjectBlob();
 size_t InjectItemCount();
-typedef void(__fastcall* OnCacheFn)(void*, void*, void*, size_t);
-void __fastcall hkOnCache(void* self, void* edx, void* msg, size_t len);
+typedef void(__fastcall* OnCacheFn)(void* self, void* msg, size_t len);
+void __fastcall hkOnCache(void* self, void* msg, size_t len);
 OnCacheFn* GetOnCacheOrigSlot();
 
 #pragma comment(lib, "d3d11.lib")
@@ -44,7 +44,6 @@ struct GameOffsets {
     uint32_t version = 1;
     uintptr_t dwLocalPlayerHero = 0;   // client.dll + X -> C_DOTA_BaseNPC_Hero*
     uintptr_t m_hWearables = 0;        // hero + X -> EHANDLE[8] wearable list
-    uintptr_t m_hMyWearablesUnused = 0;
     uintptr_t m_ItemView = 0;          // C_EconWearable + X -> CEconItemView
     uintptr_t m_iItemDefIndex = 0;     // itemView + X -> int32 def index  <-- THE write
     uintptr_t m_nFallbackPaint = 0;    // itemView + X -> paint kit (styles)
@@ -77,46 +76,54 @@ static uintptr_t HandleToEnt(uintptr_t entList, uint32_t handle) {
 // ---------- THE swap: push one hero's loadout into live entities ----------
 
 static bool PushHero(const std::string& heroKey) {
-    if (!g_Off.dwLocalPlayerHero || !g_Off.m_hWearables || !g_Off.m_iItemDefIndex)
+    if (!g_Off.dwLocalPlayerHero || !g_Off.m_hWearables || !g_Off.m_iItemDefIndex || !g_ClientBase)
         return false;
 
-    uintptr_t hero = Read<uintptr_t>(g_ClientBase + g_Off.dwLocalPlayerHero);
-    if (!hero) return false;
+    __try {
+        uintptr_t hero = Read<uintptr_t>(g_ClientBase + g_Off.dwLocalPlayerHero);
+        if (!hero) return false;
 
-    std::map<std::string, int> wants;
-    { std::lock_guard<std::mutex> lk(g_LoadoutMutex);
-      auto it = g_Loadout.find(heroKey);
-      if (it == g_Loadout.end()) return false;
-      wants = it->second; }
+        std::map<std::string, int> wants;
+        {
+            std::lock_guard<std::mutex> lk(g_LoadoutMutex);
+            auto it = g_Loadout.find(heroKey);
+            if (it == g_Loadout.end()) return false;
+            wants = it->second;
+        }
 
-    uintptr_t entList = Read<uintptr_t>(g_ClientBase + g_Off.dwEntityList);
+        uintptr_t entList = Read<uintptr_t>(g_ClientBase + g_Off.dwEntityList);
+        if (!entList) return false;
 
-    // slot order must match m_hWearables layout: head, shoulder, arms, belt, weapon, ...
-    const char* order[] = { "head","shoulder","arms","belt","weapon","mount","ambient","ward" };
-    for (int i = 0; i < 8; i++) {
-        auto w = wants.find(order[i]);
-        if (w == wants.end() || w->second < 0) continue;   // -1 = leave default
+        // slot order must match m_hWearables layout: head, shoulder, arms, belt, weapon, ...
+        const char* order[] = { "head","shoulder","arms","belt","weapon","mount","ambient","ward" };
+        for (int i = 0; i < 8; i++) {
+            auto w = wants.find(order[i]);
+            if (w == wants.end() || w->second < 0) continue;   // -1 = leave default
 
-        uint32_t handle = Read<uint32_t>(hero + g_Off.m_hWearables + i * 4);
-        if (handle == 0xFFFFFFFF) continue;
-        uintptr_t wearable = HandleToEnt(entList, handle);
-        if (!wearable) continue;
+            uint32_t handle = Read<uint32_t>(hero + g_Off.m_hWearables + i * 4);
+            if (handle == 0xFFFFFFFF || handle == 0) continue;
+            uintptr_t wearable = HandleToEnt(entList, handle);
+            if (!wearable) continue;
 
-        uintptr_t itemView = wearable + g_Off.m_ItemView;
-        Write<int32_t>(itemView + g_Off.m_iItemDefIndex, (int32_t)w->second);
-        // reset paint to stock so styles don't corrupt the new item
-        if (g_Off.m_nFallbackPaint)
-            Write<int32_t>(itemView + g_Off.m_nFallbackPaint, 0);
+            uintptr_t itemView = wearable + g_Off.m_ItemView;
+            Write<int32_t>(itemView + g_Off.m_iItemDefIndex, (int32_t)w->second);
+            // reset paint to stock so styles don't corrupt the new item
+            if (g_Off.m_nFallbackPaint)
+                Write<int32_t>(itemView + g_Off.m_nFallbackPaint, 0);
+        }
+
+        // force the hero to re-wear everything
+        if (g_Off.m_bNeedReapply)
+            Write<bool>(hero + g_Off.m_bNeedReapply, true);
+        if (g_Off.fnFullUpdate) {
+            using Fn_t = void(__fastcall*)(uintptr_t);
+            ((Fn_t)(g_ClientBase + g_Off.fnFullUpdate))(hero);
+        }
+        return true;
     }
-
-    // force the hero to re-wear everything
-    if (g_Off.m_bNeedReapply)
-        Write<bool>(hero + g_Off.m_bNeedReapply, true);
-    if (g_Off.fnFullUpdate) {
-        using Fn_t = void(__fastcall*)(uintptr_t);
-        ((Fn_t)(g_ClientBase + g_Off.fnFullUpdate))(hero);
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
-    return true;
 }
 
 // ---------- keeper thread: re-apply on spawn (death/respawn/pick wipe wearables) ----------
@@ -169,7 +176,9 @@ static void LinkThread() {
               if (!line.empty() && line.back() == '\r') line.pop_back();
               auto eq = line.find('=');
               if (eq == std::string::npos) continue;
-              g_Loadout[hero][line.substr(0, eq)] = std::stoi(line.substr(eq + 1));
+              try {
+                  g_Loadout[hero][line.substr(0, eq)] = std::stoi(line.substr(eq + 1));
+              } catch (...) {}
           } }
         g_ForcedHero = hero;
         PushHero(hero);   // instant — no waiting for the keeper tick
@@ -212,28 +221,44 @@ static void RenderInGame() {
 
 static HRESULT __stdcall hkPresent(IDXGISwapChain* ch, UINT s, UINT f) {
     if (!g_Init) {
-        ch->GetDevice(__uuidof(ID3D11Device), (void**)&g_Dev);
-        g_Dev->GetImmediateContext(&g_Ctx);
-        DXGI_SWAP_CHAIN_DESC d{}; ch->GetDesc(&d);
-        g_hWnd = d.OutputWindow;
-        ID3D11Texture2D* b = nullptr;
-        ch->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&b);
-        g_Dev->CreateRenderTargetView(b, nullptr, &g_RTV);
-        b->Release();
-        ImGui::CreateContext();
-        ImGui_ImplWin32_Init(g_hWnd);
-        ImGui_ImplDX11_Init(g_Dev, g_Ctx);
-        ImGui::StyleColorsDark();
-        oWndProc = (WNDPROC)SetWindowLongPtr(g_hWnd, GWLP_WNDPROC, (LONG_PTR)DllWndProc);
-        g_Init = true;
+        if (SUCCEEDED(ch->GetDevice(__uuidof(ID3D11Device), (void**)&g_Dev)) && g_Dev) {
+            g_Dev->GetImmediateContext(&g_Ctx);
+            DXGI_SWAP_CHAIN_DESC d{}; ch->GetDesc(&d);
+            g_hWnd = d.OutputWindow;
+            ID3D11Texture2D* b = nullptr;
+            if (SUCCEEDED(ch->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&b)) && b) {
+                g_Dev->CreateRenderTargetView(b, nullptr, &g_RTV);
+                b->Release();
+            }
+            ImGui::CreateContext();
+            ImGui_ImplWin32_Init(g_hWnd);
+            ImGui_ImplDX11_Init(g_Dev, g_Ctx);
+            ImGui::StyleColorsDark();
+            oWndProc = (WNDPROC)SetWindowLongPtr(g_hWnd, GWLP_WNDPROC, (LONG_PTR)DllWndProc);
+            g_Init = true;
+        }
     }
-    ImGui_ImplDX11_NewFrame();
-    ImGui_ImplWin32_NewFrame();
-    ImGui::NewFrame();
-    if (g_Show) RenderInGame();
-    ImGui::Render();
-    g_Ctx->OMSetRenderTargets(1, &g_RTV, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (g_Show && g_RTV && g_Ctx) {
+        ImGui::GetIO().MouseDrawCursor = true;
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        RenderInGame();
+        ImGui::Render();
+
+        ID3D11RenderTargetView* prevRTV = nullptr;
+        ID3D11DepthStencilView* prevDSV = nullptr;
+        g_Ctx->OMGetRenderTargets(1, &prevRTV, &prevDSV);
+
+        g_Ctx->OMSetRenderTargets(1, &g_RTV, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        g_Ctx->OMSetRenderTargets(1, &prevRTV, prevDSV);
+        if (prevRTV) prevRTV->Release();
+        if (prevDSV) prevDSV->Release();
+    } else if (g_Init) {
+        ImGui::GetIO().MouseDrawCursor = false;
+    }
     return oPresent(ch, s, f);
 }
 
@@ -268,11 +293,21 @@ DWORD WINAPI MainThread(LPVOID mod) {
     BuildInjectBlob();
 
     while (!GetModuleHandleA("d3d11.dll")) Sleep(500);
+
+    // Create a temporary dummy window to safely retrieve the DX11 Present vtable pointer
+    WNDCLASSA wc{};
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = "WardrobeDummy";
+    RegisterClassA(&wc);
+    HWND dummyHwnd = CreateWindowA("WardrobeDummy", "dummy", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
+
     D3D_FEATURE_LEVEL lv;
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 1; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = GetForegroundWindow(); sd.SampleDesc.Count = 1;
+    sd.OutputWindow = dummyHwnd ? dummyHwnd : GetDesktopWindow();
+    sd.SampleDesc.Count = 1;
     sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
     ID3D11Device* d = nullptr; IDXGISwapChain* s = nullptr; ID3D11DeviceContext* c = nullptr;
     if (SUCCEEDED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -283,6 +318,8 @@ DWORD WINAPI MainThread(LPVOID mod) {
         MH_CreateHook(present, &hkPresent, (void**)&oPresent);
         MH_EnableHook(present);
     }
+    if (dummyHwnd) DestroyWindow(dummyHwnd);
+    UnregisterClassA("WardrobeDummy", wc.hInstance);
 
     // GC inventory hook: append fake SO records to every Welcome/Cache message.
     // gc_hook.txt holds the RVA (from dump_offsets.py). Missing file = unlock off,
@@ -304,11 +341,13 @@ DWORD WINAPI MainThread(LPVOID mod) {
         }
     }
 
-    // erase PE headers — mapped image stops looking like a module
-    DWORD old;
-    VirtualProtect(mod, 0x1000, PAGE_READWRITE, &old);
-    memset(mod, 0, 0x1000);
-    VirtualProtect(mod, 0x1000, old, &old);
+    // erase PE headers if mod pointer is valid
+    if (mod) {
+        DWORD old;
+        VirtualProtect(mod, 0x1000, PAGE_READWRITE, &old);
+        memset(mod, 0, 0x1000);
+        VirtualProtect(mod, 0x1000, old, &old);
+    }
 
     std::thread(KeeperThread).detach();
     std::thread(LinkThread).detach();

@@ -5,9 +5,11 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <algorithm>
 
 static DWORD FindPid(const char* exe) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32 pe{ sizeof(pe) };
     DWORD out = 0;
     if (Process32First(snap, &pe)) do {
@@ -17,78 +19,129 @@ static DWORD FindPid(const char* exe) {
     return out;
 }
 
-// minimal manual map: headers + sections, relocations, imports, entry call
-static bool ManualMap(HANDLE proc, const std::vector<uint8_t>& img, void** outEntry) {
-    auto dos = (IMAGE_DOS_HEADER*)img.data();
-    auto nt = (IMAGE_NT_HEADERS64*)(img.data() + dos->e_lfanew);
-    SIZE_T size = nt->OptionalHeader.SizeOfImage;
-    uint8_t* remote = (uint8_t*)VirtualAllocEx(proc, nullptr, size,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remote) return false;
+// robust manual map: local stage -> relocate -> resolve imports -> write remote -> stub execute
+static bool ManualMap(HANDLE proc, const std::vector<uint8_t>& img, uint8_t** outRemoteBase, uintptr_t* outEntry) {
+    if (img.size() < sizeof(IMAGE_DOS_HEADER)) return false;
 
-    // headers
-    WriteProcessMemory(proc, remote, img.data(), nt->OptionalHeader.SizeOfHeaders, nullptr);
-    // sections
+    auto dos = (const IMAGE_DOS_HEADER*)img.data();
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+
+    if (dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > img.size()) return false;
+    auto nt = (const IMAGE_NT_HEADERS64*)(img.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        std::cout << "[!] Target image must be 64-bit.\n";
+        return false;
+    }
+
+    SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
+    uint8_t* remoteBase = (uint8_t*)VirtualAllocEx(proc, nullptr, imageSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remoteBase) {
+        std::cout << "[!] VirtualAllocEx failed: " << GetLastError() << "\n";
+        return false;
+    }
+
+    // Allocate local buffer to stage the memory layout before writing to remote
+    std::vector<uint8_t> local(imageSize, 0);
+
+    // 1. Copy headers
+    size_t headerSize = min((size_t)nt->OptionalHeader.SizeOfHeaders, img.size());
+    memcpy(local.data(), img.data(), headerSize);
+
+    // 2. Copy sections into virtual layout
     auto sec = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        if (sec->SizeOfRawData)
-            WriteProcessMemory(proc, remote + sec->VirtualAddress,
-                img.data() + sec->PointerToRawData, sec->SizeOfRawData, nullptr);
-    }
-    // relocations
-    uintptr_t delta = (uintptr_t)remote - nt->OptionalHeader.ImageBase;
-    if (delta && nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) {
-        auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-        uint8_t* base = remote + dir.VirtualAddress;
-        SIZE_T done = 0;
-        while (done < dir.Size) {
-            auto blk = (IMAGE_BASE_RELOCATION*)(base + done);
-            if (!blk->SizeOfBlock) break;
-            int n = (blk->SizeOfBlock - sizeof(*blk)) / sizeof(WORD);
-            WORD* rel = (WORD*)(blk + 1);
-            for (int i = 0; i < n; i++) {
-                if ((rel[i] >> 12) == IMAGE_REL_BASED_DIR64) {
-                    uintptr_t at = (uintptr_t)remote + blk->VirtualAddress + (rel[i] & 0xFFF);
-                    uintptr_t v = 0;
-                    ReadProcessMemory(proc, (void*)at, &v, 8, nullptr);
-                    v += delta;
-                    WriteProcessMemory(proc, (void*)at, &v, 8, nullptr);
-                }
+        if (sec->SizeOfRawData && sec->PointerToRawData < img.size()) {
+            size_t copySize = (size_t)sec->SizeOfRawData;
+            if (sec->PointerToRawData + copySize > img.size()) {
+                copySize = img.size() - sec->PointerToRawData;
             }
-            done += blk->SizeOfBlock;
+            if (sec->VirtualAddress + copySize <= imageSize) {
+                memcpy(local.data() + sec->VirtualAddress, img.data() + sec->PointerToRawData, copySize);
+            }
         }
     }
-    // imports — resolve via local LoadLibrary/GetProcAddress then write remote IAT
-    // (loader-side resolve is fine: same OS, same DLL versions for system libs)
+
+    // 3. Base relocations
+    uintptr_t delta = (uintptr_t)remoteBase - nt->OptionalHeader.ImageBase;
+    if (delta != 0 && nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) {
+        auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (dir.VirtualAddress + dir.Size <= imageSize) {
+            uint8_t* relocBase = local.data() + dir.VirtualAddress;
+            SIZE_T done = 0;
+            while (done < dir.Size) {
+                auto blk = (IMAGE_BASE_RELOCATION*)(relocBase + done);
+                if (!blk->SizeOfBlock || blk->SizeOfBlock > (dir.Size - done)) break;
+                int count = (blk->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+                WORD* list = (WORD*)(blk + 1);
+                for (int i = 0; i < count; i++) {
+                    int type = list[i] >> 12;
+                    int offset = list[i] & 0xFFF;
+                    if (type == IMAGE_REL_BASED_DIR64) {
+                        uintptr_t patchRva = blk->VirtualAddress + offset;
+                        if (patchRva + sizeof(uintptr_t) <= imageSize) {
+                            uintptr_t* patchAddr = (uintptr_t*)(local.data() + patchRva);
+                            *patchAddr += delta;
+                        }
+                    }
+                }
+                done += blk->SizeOfBlock;
+            }
+        }
+    }
+
+    // 4. Resolve imports in local image using local system libraries
     if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
         auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-        auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(img.data() + dir.VirtualAddress);
-        for (; imp->Name; imp++) {
-            const char* dll = (const char*)(img.data() + imp->Name);
-            HMODULE local = LoadLibraryA(dll);
-            if (!local) return false;
-            auto oft = (IMAGE_THUNK_DATA64*)(img.data() + imp->OriginalFirstThunk);
-            auto ft = (IMAGE_THUNK_DATA64*)(img.data() + imp->FirstThunk);
-            for (; oft->u1.AddressOfData; oft++, ft++) {
-                FARPROC fn = nullptr;
-                if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG64)
-                    fn = GetProcAddress(local, (LPCSTR)(oft->u1.Ordinal & 0xFFFF));
-                else {
-                    auto by = (IMAGE_IMPORT_BY_NAME*)(img.data() + oft->u1.AddressOfData);
-                    fn = GetProcAddress(local, by->Name);
+        if (dir.VirtualAddress < imageSize) {
+            auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(local.data() + dir.VirtualAddress);
+            for (; imp->Name && imp->Name < imageSize; imp++) {
+                const char* dllName = (const char*)(local.data() + imp->Name);
+                HMODULE hMod = LoadLibraryA(dllName);
+                if (!hMod) {
+                    std::cout << "[!] Could not load import module: " << dllName << "\n";
+                    VirtualFreeEx(proc, remoteBase, 0, MEM_RELEASE);
+                    return false;
                 }
-                if (!fn) return false;
-                uintptr_t iatAt = (uintptr_t)remote + imp->FirstThunk
-                    + ((uint8_t*)ft - (img.data() + imp->FirstThunk));
-                WriteProcessMemory(proc, (void*)iatAt, &fn, 8, nullptr);
+
+                uint32_t thunkRva = imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk;
+                if (!thunkRva || thunkRva >= imageSize || imp->FirstThunk >= imageSize) continue;
+
+                auto origThunk = (IMAGE_THUNK_DATA64*)(local.data() + thunkRva);
+                auto firstThunk = (IMAGE_THUNK_DATA64*)(local.data() + imp->FirstThunk);
+
+                for (; origThunk->u1.AddressOfData; origThunk++, firstThunk++) {
+                    FARPROC fn = nullptr;
+                    if (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
+                        fn = GetProcAddress(hMod, (LPCSTR)(origThunk->u1.Ordinal & 0xFFFF));
+                    } else {
+                        uint32_t nameRva = (uint32_t)origThunk->u1.AddressOfData;
+                        if (nameRva < imageSize) {
+                            auto byName = (IMAGE_IMPORT_BY_NAME*)(local.data() + nameRva);
+                            fn = GetProcAddress(hMod, byName->Name);
+                        }
+                    }
+                    if (!fn) {
+                        std::cout << "[!] Failed to resolve symbol in " << dllName << "\n";
+                        VirtualFreeEx(proc, remoteBase, 0, MEM_RELEASE);
+                        return false;
+                    }
+                    firstThunk->u1.Function = (ULONGLONG)fn;
+                }
             }
         }
     }
-    // entry
-    *outEntry = remote + nt->OptionalHeader.AddressOfEntryPoint;
-    // flip image to executable: whole RX is simplest + quiet enough post-header-erase
-    DWORD old;
-    VirtualProtectEx(proc, remote, size, PAGE_EXECUTE_READ, &old);
+
+    // 5. Write staged image into remote process memory
+    if (!WriteProcessMemory(proc, remoteBase, local.data(), imageSize, nullptr)) {
+        std::cout << "[!] WriteProcessMemory failed: " << GetLastError() << "\n";
+        VirtualFreeEx(proc, remoteBase, 0, MEM_RELEASE);
+        return false;
+    }
+
+    *outRemoteBase = remoteBase;
+    *outEntry = (uintptr_t)remoteBase + nt->OptionalHeader.AddressOfEntryPoint;
     return true;
 }
 
@@ -99,21 +152,68 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> img((std::istreambuf_iterator<char>(f)), {});
 
     DWORD pid = FindPid("dota2.exe");
-    if (!pid) { std::cout << "[!] start Dota 2 first, baby — then run me.\n"; return 1; }
+    if (!pid) { std::cout << "[!] start Dota 2 first, then run map.exe.\n"; return 1; }
 
     HANDLE proc = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
         | PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD, FALSE, pid);
     if (!proc) { std::cout << "[!] OpenProcess failed: " << GetLastError() << "\n"; return 1; }
 
-    void* entry = nullptr;
-    if (!ManualMap(proc, img, &entry)) { std::cout << "[!] map failed\n"; return 1; }
+    uint8_t* remoteBase = nullptr;
+    uintptr_t entry = 0;
+    if (!ManualMap(proc, img, &remoteBase, &entry)) {
+        std::cout << "[!] Manual map staging failed.\n";
+        CloseHandle(proc);
+        return 1;
+    }
+
+    // Allocate a small remote stub to invoke DllMain((HINSTANCE)remoteBase, DLL_PROCESS_ATTACH, nullptr)
+    // Stub byte assembly for x64:
+    //   48 83 EC 28                 sub rsp, 28h
+    //   48 B9 <remoteBase: 8 bytes> mov rcx, remoteBase
+    //   BA 01 00 00 00              mov edx, 1
+    //   45 31 C0                    xor r8d, r8d
+    //   48 B8 <entry: 8 bytes>      mov rax, entry
+    //   FF D0                       call rax
+    //   48 83 C4 28                 add rsp, 28h
+    //   C3                          ret
+    uint8_t stubCode[] = {
+        0x48, 0x83, 0xEC, 0x28,
+        0x48, 0xB9, 0,0,0,0,0,0,0,0,
+        0xBA, 0x01, 0x00, 0x00, 0x00,
+        0x45, 0x31, 0xC0,
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,
+        0xFF, 0xD0,
+        0x48, 0x83, 0xC4, 0x28,
+        0xC3
+    };
+    memcpy(&stubCode[6], &remoteBase, sizeof(remoteBase));
+    memcpy(&stubCode[24], &entry, sizeof(entry));
+
+    uint8_t* remoteStub = (uint8_t*)VirtualAllocEx(proc, nullptr, sizeof(stubCode),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remoteStub) {
+        std::cout << "[!] Remote stub allocation failed: " << GetLastError() << "\n";
+        CloseHandle(proc);
+        return 1;
+    }
+
+    WriteProcessMemory(proc, remoteStub, stubCode, sizeof(stubCode), nullptr);
 
     HANDLE th = CreateRemoteThread(proc, nullptr, 0,
-        (LPTHREAD_START_ROUTINE)entry, nullptr, 0, nullptr);
-    if (!th) { std::cout << "[!] remote thread failed: " << GetLastError() << "\n"; return 1; }
-    WaitForSingleObject(th, 5000);
+        (LPTHREAD_START_ROUTINE)remoteStub, nullptr, 0, nullptr);
+    if (!th) {
+        std::cout << "[!] CreateRemoteThread failed: " << GetLastError() << "\n";
+        VirtualFreeEx(proc, remoteStub, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return 1;
+    }
+
+    WaitForSingleObject(th, 6000);
     CloseHandle(th);
+
+    VirtualFreeEx(proc, remoteStub, 0, MEM_RELEASE);
     CloseHandle(proc);
-    std::cout << "[OK] mapped + running. INSERT in-game for the live menu.\n";
+
+    std::cout << "[OK] mapped + initialized. Press INSERT in-game to toggle status menu.\n";
     return 0;
 }

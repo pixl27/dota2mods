@@ -10,6 +10,7 @@ using json = nlohmann::json;
 struct SkinEntry {
     int defIndex = 0;
     std::string name, hero, slot, rarity, prefab;
+    std::string bundle;
 };
 
 struct Config {
@@ -21,6 +22,7 @@ struct Config {
 
 extern Config g_Cfg;
 extern std::vector<SkinEntry> g_DB;
+extern std::vector<std::string> g_UniqueHeroes;
 extern std::mutex g_DbMutex;
 extern std::map<std::string, std::map<std::string, int>> g_Loadout;
 extern std::mutex g_LoadoutMutex;
