@@ -73,12 +73,16 @@ copy /Y cfg\gamestate_integration_wardrobe.cfg build\ >nul
 copy /Y gen_full_db.py build\ >nul
 copy /Y gen_names.py build\ >nul
 copy /Y dump_offsets.py build\ >nul
+copy /Y auto_find_gc.py build\ >nul
+copy /Y launch_level3.bat build\ >nul
 
 echo.
 echo [OK] Done. Folder build\ now holds:
 echo      wardrobe.exe      - the overlay. Run this. No admin, no injection.
 echo      wardrobe_dll.dll  - live-swap payload. map.exe ONLY, never double-click.
 echo      map.exe           - manual-map loader. Usage: map.exe wardrobe_dll.dll
+echo      launch_level3.bat - 1-click launcher for Level 3 (GC Inventory Unlock).
+echo      auto_find_gc.py   - automated GC hook RVA detector.
 echo      gamestate_integration_wardrobe.cfg - copy into Dota cfg folder (see README).
 echo.
 pause

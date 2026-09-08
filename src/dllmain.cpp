@@ -279,6 +279,104 @@ static bool LoadOffsets() {
     return false;
 }
 
+// Automatic in-memory discovery of the GC Cache dispatch function in client.dll.
+// Searches for string "SOCacheSubscribed", resolves RIP-relative LEA references,
+// and locates the handler callback or function entry point.
+static uintptr_t FindGCHookAuto(uintptr_t base) {
+    if (!base) return 0;
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        uintptr_t textStart = 0; size_t textSize = 0;
+        uintptr_t rdataStart = 0; size_t rdataSize = 0;
+
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+            char sname[9] = {};
+            memcpy(sname, sec->Name, 8);
+            if (!strcmp(sname, ".text")) {
+                textStart = base + sec->VirtualAddress;
+                textSize = sec->Misc.VirtualSize;
+            } else if (!strcmp(sname, ".rdata")) {
+                rdataStart = base + sec->VirtualAddress;
+                rdataSize = sec->Misc.VirtualSize;
+            }
+        }
+
+        if (!rdataStart) { rdataStart = base; rdataSize = nt->OptionalHeader.SizeOfImage; }
+        if (!textStart) { textStart = base; textSize = nt->OptionalHeader.SizeOfImage; }
+
+        // 1. Locate string "SOCacheSubscribed" in .rdata
+        const char target[] = "SOCacheSubscribed";
+        size_t tlen = sizeof(target) - 1;
+        uintptr_t strAddr = 0;
+        for (uintptr_t p = rdataStart; p <= rdataStart + rdataSize - tlen; p++) {
+            if (memcmp((const void*)p, target, tlen) == 0) {
+                strAddr = p;
+                break;
+            }
+        }
+        if (!strAddr) return 0;
+
+        // 2. Scan .text for RIP-relative LEA instructions referencing strAddr
+        uintptr_t xrefAddr = 0;
+        for (uintptr_t p = textStart; p <= textStart + textSize - 7; p++) {
+            uint8_t b0 = *(uint8_t*)p;
+            uint8_t b1 = *(uint8_t*)(p + 1);
+            if ((b0 == 0x48 || b0 == 0x4C) && b1 == 0x8D) {
+                uint8_t modrm = *(uint8_t*)(p + 2);
+                if ((modrm & 0xC7) == 0x05) {
+                    int32_t disp = *(int32_t*)(p + 3);
+                    if (p + 7 + disp == strAddr) {
+                        xrefAddr = p;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!xrefAddr) return 0;
+
+        // 2b. Check if nearby instructions (within 40 bytes) have another LEA pointing to .text
+        uintptr_t scanStart = (xrefAddr >= 40) ? (xrefAddr - 40) : textStart;
+        for (uintptr_t p = scanStart; p <= xrefAddr + 40 && p <= textStart + textSize - 7; p++) {
+            if (p == xrefAddr) continue;
+            uint8_t b0 = *(uint8_t*)p;
+            uint8_t b1 = *(uint8_t*)(p + 1);
+            if ((b0 == 0x48 || b0 == 0x4C) && b1 == 0x8D) {
+                uint8_t modrm = *(uint8_t*)(p + 2);
+                if ((modrm & 0xC7) == 0x05) {
+                    int32_t disp = *(int32_t*)(p + 3);
+                    uintptr_t tgt = p + 7 + disp;
+                    if (tgt >= textStart && tgt < textStart + textSize) {
+                        return tgt - base;
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: walk backward from xrefAddr to find function prologue
+        for (uintptr_t p = xrefAddr; p > xrefAddr - 0x1000 && p > textStart; p--) {
+            uint8_t prev = *(uint8_t*)(p - 1);
+            if (prev == 0xCC || prev == 0xC3 || prev == 0x90) {
+                uint8_t c0 = *(uint8_t*)p;
+                uint8_t c1 = *(uint8_t*)(p + 1);
+                uint8_t c2 = *(uint8_t*)(p + 2);
+                if ((c0 == 0x48 && c1 == 0x89 && c2 == 0x5C) ||
+                    (c0 == 0x48 && c1 == 0x83 && c2 == 0xEC) ||
+                    (c0 == 0x48 && c1 == 0x81 && c2 == 0xEC) ||
+                    (c0 == 0x40 && (c1 == 0x53 || c1 == 0x55 || c1 == 0x57)) ||
+                    (c0 == 0x55 && c1 == 0x48 && (c2 == 0x89 || c2 == 0x8B))) {
+                    return p - base;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
 DWORD WINAPI MainThread(LPVOID mod) {
     g_ClientBase = (uintptr_t)GetModuleHandleA("client.dll");
     int waits = 0;
@@ -322,9 +420,9 @@ DWORD WINAPI MainThread(LPVOID mod) {
     UnregisterClassA("WardrobeDummy", wc.hInstance);
 
     // GC inventory hook: append fake SO records to every Welcome/Cache message.
-    // gc_hook.txt holds the RVA (from dump_offsets.py). Missing file = unlock off,
-    // writer still works. Safest default.
+    // gc_hook.txt holds the RVA (from dump_offsets.py). If missing, FindGCHookAuto scans client.dll.
     {
+        uintptr_t rva = 0;
         FILE* gf = nullptr;
         const char* gc_paths[] = { "gc_hook.txt", "build/gc_hook.txt", "C:\\Temp\\opencode\\gc_hook.txt" };
         for (auto gp : gc_paths) {
@@ -335,12 +433,15 @@ DWORD WINAPI MainThread(LPVOID mod) {
             char line[64] = {};
             fread(line, 1, sizeof(line) - 1, gf);
             fclose(gf);
-            uintptr_t rva = (uintptr_t)strtoull(line, nullptr, 16);
-            if (rva && g_ClientBase) {
-                void* target = (void*)(g_ClientBase + rva);
-                MH_CreateHook(target, &hkOnCache, (void**)GetOnCacheOrigSlot());
-                MH_EnableHook(target);
-            }
+            rva = (uintptr_t)strtoull(line, nullptr, 16);
+        }
+        if (!rva && g_ClientBase) {
+            rva = FindGCHookAuto(g_ClientBase);
+        }
+        if (rva && g_ClientBase) {
+            void* target = (void*)(g_ClientBase + rva);
+            MH_CreateHook(target, &hkOnCache, (void**)GetOnCacheOrigSlot());
+            MH_EnableHook(target);
         }
     }
 

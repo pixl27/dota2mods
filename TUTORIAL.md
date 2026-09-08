@@ -226,9 +226,36 @@ As a result, **Dota 2's official main-menu Armory, Hero loadout screens, and pre
 
 ---
 
-### 4.2 How to Find the GC Hook RVA (`gc_hook.txt`)
+### 4.2 Automated 1-Click Method (For Non-Programmers)
 
-To enable Level 3, you need the RVA (Relative Virtual Address) of the GC cache dispatch function in `client.dll`.
+You do **not** need IDA Pro, Ghidra, or any reverse engineering experience to use Level 3. Everything has been automated into a single click:
+
+#### Option A: Double-Click `launch_level3.bat` (Easiest)
+1. Launch **Dota 2** and wait until you reach the main menu.
+2. Double-click **`launch_level3.bat`** (or `build\launch_level3.bat`):
+   - Automatically checks if `dota2.exe` is running.
+   - If `gc_hook.txt` is missing, it runs `auto_find_gc.py` to detect Steam and find the hook RVA automatically.
+   - Automatically syncs the skin database (`skins_full.json`) and offsets.
+   - Maps `wardrobe_dll.dll` cleanly into `dota2.exe`.
+3. Return to Dota 2, press <kbd>INSERT</kbd>, and navigate to **Heroes $\to$ Armory**. All items will be unlocked!
+
+#### Option B: Zero-Config In-Memory Auto-Scanner
+If `gc_hook.txt` is not present, `wardrobe_dll.dll` features a built-in runtime signature scanner (`FindGCHookAuto`). When mapped, it automatically scans `client.dll` memory in real time, resolves the `SOCacheSubscribed` dispatch handler, and hooks it on the fly.
+
+#### Option C: Run `auto_find_gc.py` (Standalone Tool)
+If you want to generate `gc_hook.txt` ahead of time without reverse engineering:
+```powershell
+python auto_find_gc.py
+```
+- Automatically detects your Steam library folders (even on external drives `D:`, `E:`, etc.).
+- Parses `client.dll` with zero external dependencies.
+- Discovers the exact RVA and saves `gc_hook.txt` to `build/` and `C:\Temp\opencode\`.
+
+---
+
+### 4.3 Advanced / Manual Method (IDA Pro or Ghidra)
+
+If Dota 2 receives an unusual engine update and you prefer locating the RVA manually:
 
 #### Step-by-step in IDA Pro or Ghidra:
 1. Open `<Steam>\steamapps\common\dota 2 beta\game\bin\win64\client.dll` in IDA Pro or Ghidra.
@@ -243,38 +270,21 @@ To enable Level 3, you need the RVA (Relative Virtual Address) of the GC cache d
 7. Calculate the **RVA**:
    $$\text{RVA} = \text{Function Address} - \text{client.dll Image Base}$$
 8. Convert this RVA to hexadecimal (e.g., `0x1A2B3C4` $\to$ `1A2B3C4`).
-
----
-
-### 4.3 Setting Up `gc_hook.txt`
-
-Save your hexadecimal RVA into a file named `gc_hook.txt`:
-
-```powershell
-echo 1A2B3C4 > build\gc_hook.txt
-```
-*(Also copy `gc_hook.txt` to `C:\Temp\opencode\gc_hook.txt` if using the fallback path).*
-
-Ensure the skin database is present next to the DLL:
-```powershell
-copy data\skins_full.json build\data\skins_full.json
-```
-
----
-
-### 4.4 Running Level 3
-
-1. Start **Dota 2** and wait until the game reaches the main menu loading screen.
-2. Open an administrator PowerShell / Command Prompt and map the payload:
+9. Save the hex string into `build\gc_hook.txt`:
    ```powershell
-   build\map.exe build\wardrobe_dll.dll
+   echo 1A2B3C4 > build\gc_hook.txt
    ```
-3. Open Dota 2 and press <kbd>INSERT</kbd>.
-4. The live status menu will show:
+
+---
+
+### 4.4 In-Game Verification
+
+1. Press <kbd>INSERT</kbd> to toggle the live status overlay.
+2. The HUD will indicate:
    ```
    status: live | inv unlock: 12480 items
    ```
-5. Navigate to **Heroes** $\to$ **Armory** in the official Dota 2 menu:
+3. Navigate to **Heroes** $\to$ **Armory** in the official Dota 2 menu:
    - All Arcanas, Immortals, taunts, couriers, and personas are unlocked.
    - You can equip items, change styles, and preview animations directly inside the official game interface.
 
