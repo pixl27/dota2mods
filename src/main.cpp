@@ -88,13 +88,14 @@ LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 void MakeOverlay(HINSTANCE inst) {
+    const char* cls = "DWM_NotificationOverlay";
     WNDCLASSA wc{ CS_HREDRAW | CS_VREDRAW, OverlayProc, 0, 0, inst,
-        nullptr, nullptr, nullptr, nullptr, "WardrobeOverlay" };
+        nullptr, nullptr, nullptr, nullptr, cls };
     RegisterClassA(&wc);
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     g_Overlay = CreateWindowExA(
         WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
-        "WardrobeOverlay", "Wardrobe", WS_POPUP,
+        cls, "", WS_POPUP,
         0, 0, sw, sh, nullptr, nullptr, inst, nullptr);
     SetLayeredWindowAttributes(g_Overlay, RGB(0, 0, 0), 255, LWA_ALPHA);
     MARGINS mg{ -1,-1,-1,-1 };

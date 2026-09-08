@@ -24,6 +24,74 @@ namespace stealth {
     };
     inline Offsets g_Off;
 
+    // Direct NT system call typedefs to bypass user-mode API hooks on kernel32
+    typedef struct _UNICODE_STRING {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR  Buffer;
+    } UNICODE_STRING, *PUNICODE_STRING;
+
+    typedef struct _OBJECT_ATTRIBUTES {
+        ULONG Length;
+        HANDLE RootDirectory;
+        PUNICODE_STRING ObjectName;
+        ULONG Attributes;
+        PVOID SecurityDescriptor;
+        PVOID SecurityQualityOfService;
+    } OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+
+    typedef struct _CLIENT_ID {
+        HANDLE UniqueProcess;
+        HANDLE UniqueThread;
+    } CLIENT_ID, *PCLIENT_ID;
+
+    typedef LONG(NTAPI* pfnNtOpenProcess)(
+        PHANDLE ProcessHandle,
+        ACCESS_MASK DesiredAccess,
+        POBJECT_ATTRIBUTES ObjectAttributes,
+        PCLIENT_ID ClientId
+    );
+
+    typedef LONG(NTAPI* pfnNtReadVirtualMemory)(
+        HANDLE ProcessHandle,
+        PVOID BaseAddress,
+        PVOID Buffer,
+        SIZE_T NumberOfBytesToRead,
+        PSIZE_T NumberOfBytesRead
+    );
+
+    typedef LONG(NTAPI* pfnNtWriteVirtualMemory)(
+        HANDLE ProcessHandle,
+        PVOID BaseAddress,
+        PVOID Buffer,
+        SIZE_T NumberOfBytesToWrite,
+        PSIZE_T NumberOfBytesWritten
+    );
+
+    typedef LONG(NTAPI* pfnNtClose)(HANDLE Handle);
+
+    struct NtApi {
+        pfnNtOpenProcess NtOpenProcess = nullptr;
+        pfnNtReadVirtualMemory NtReadVirtualMemory = nullptr;
+        pfnNtWriteVirtualMemory NtWriteVirtualMemory = nullptr;
+        pfnNtClose NtClose = nullptr;
+
+        NtApi() {
+            HMODULE hNt = GetModuleHandleA("ntdll.dll");
+            if (hNt) {
+                NtOpenProcess = (pfnNtOpenProcess)GetProcAddress(hNt, "NtOpenProcess");
+                NtReadVirtualMemory = (pfnNtReadVirtualMemory)GetProcAddress(hNt, "NtReadVirtualMemory");
+                NtWriteVirtualMemory = (pfnNtWriteVirtualMemory)GetProcAddress(hNt, "NtWriteVirtualMemory");
+                NtClose = (pfnNtClose)GetProcAddress(hNt, "NtClose");
+            }
+        }
+    };
+
+    inline NtApi& GetNt() {
+        static NtApi s_Nt;
+        return s_Nt;
+    }
+
     inline bool LoadOffsets() {
         const char* paths[] = { "offsets.bin", "build/offsets.bin", "C:\\Temp\\opencode\\offsets.bin" };
         for (auto p : paths) {
@@ -69,8 +137,43 @@ namespace stealth {
     }
 
     inline HANDLE SpoofedHandle(DWORD pid) {
-        return OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
-            | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        auto& nt = GetNt();
+        if (nt.NtOpenProcess) {
+            HANDLE h = nullptr;
+            OBJECT_ATTRIBUTES oa{};
+            oa.Length = sizeof(oa);
+            CLIENT_ID cid{};
+            cid.UniqueProcess = (HANDLE)(uintptr_t)pid;
+            LONG st = nt.NtOpenProcess(&h, PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, &oa, &cid);
+            if (st >= 0 && h) return h;
+        }
+        return OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
+    }
+
+    inline void CloseProcHandle(HANDLE h) {
+        auto& nt = GetNt();
+        if (nt.NtClose) nt.NtClose(h);
+        else CloseHandle(h);
+    }
+
+    template<typename T>
+    inline bool ReadMem(HANDLE h, uintptr_t addr, T* outVal) {
+        auto& nt = GetNt();
+        SIZE_T read = 0;
+        if (nt.NtReadVirtualMemory) {
+            return nt.NtReadVirtualMemory(h, (PVOID)addr, outVal, sizeof(T), &read) >= 0;
+        }
+        return ReadProcessMemory(h, (void*)addr, outVal, sizeof(T), &read) != FALSE;
+    }
+
+    template<typename T>
+    inline bool WriteMem(HANDLE h, uintptr_t addr, const T& inVal) {
+        auto& nt = GetNt();
+        SIZE_T written = 0;
+        if (nt.NtWriteVirtualMemory) {
+            return nt.NtWriteVirtualMemory(h, (PVOID)addr, (PVOID)&inVal, sizeof(T), &written) >= 0;
+        }
+        return WriteProcessMemory(h, (void*)addr, &inVal, sizeof(T), &written) != FALSE;
     }
 
     inline uintptr_t GetRemoteModuleBase(DWORD pid, const char* modName) {
@@ -93,10 +196,9 @@ namespace stealth {
     inline uintptr_t RemoteHandleToEnt(HANDLE h, uintptr_t entList, uint32_t handle) {
         uint32_t idx = handle & 0xFFF;
         uintptr_t chunk = 0;
-        ReadProcessMemory(h, (void*)(entList + 0x8 * (idx >> 9) + 0x10), &chunk, sizeof(chunk), nullptr);
-        if (!chunk) return 0;
+        if (!ReadMem(h, entList + 0x8 * (idx >> 9) + 0x10, &chunk) || !chunk) return 0;
         uintptr_t ent = 0;
-        ReadProcessMemory(h, (void*)(chunk + 0x70 * (idx & 0x1FF)), &ent, sizeof(ent), nullptr);
+        if (!ReadMem(h, chunk + 0x70 * (idx & 0x1FF), &ent)) return 0;
         return ent;
     }
 
@@ -109,14 +211,13 @@ namespace stealth {
 
         uintptr_t clientBase = GetRemoteModuleBase(pid, "client.dll");
         if (!clientBase) {
-            CloseHandle(h);
+            CloseProcHandle(h);
             return false;
         }
 
         uintptr_t hero = 0;
-        ReadProcessMemory(h, (void*)(clientBase + g_Off.dwLocalHero), &hero, sizeof(hero), nullptr);
-        if (!hero) {
-            CloseHandle(h);
+        if (!ReadMem(h, clientBase + g_Off.dwLocalHero, &hero) || !hero) {
+            CloseProcHandle(h);
             return false;
         }
 
@@ -125,16 +226,15 @@ namespace stealth {
             std::lock_guard<std::mutex> lk(g_LoadoutMutex);
             auto it = g_Loadout.find(heroKey);
             if (it == g_Loadout.end()) {
-                CloseHandle(h);
+                CloseProcHandle(h);
                 return false;
             }
             wants = it->second;
         }
 
         uintptr_t entList = 0;
-        ReadProcessMemory(h, (void*)(clientBase + g_Off.dwEntityList), &entList, sizeof(entList), nullptr);
-        if (!entList) {
-            CloseHandle(h);
+        if (!ReadMem(h, clientBase + g_Off.dwEntityList, &entList) || !entList) {
+            CloseProcHandle(h);
             return false;
         }
 
@@ -144,28 +244,28 @@ namespace stealth {
             if (w == wants.end() || w->second < 0) continue;
 
             uint32_t handle = 0;
-            ReadProcessMemory(h, (void*)(hero + g_Off.m_hWearables + i * 4), &handle, sizeof(handle), nullptr);
-            if (handle == 0xFFFFFFFF || handle == 0) continue;
+            if (!ReadMem(h, hero + g_Off.m_hWearables + i * 4, &handle) || handle == 0xFFFFFFFF || handle == 0)
+                continue;
 
             uintptr_t wearable = RemoteHandleToEnt(h, entList, handle);
             if (!wearable) continue;
 
             uintptr_t itemView = wearable + g_Off.m_ItemView;
             int32_t defIndex = (int32_t)w->second;
-            WriteProcessMemory(h, (void*)(itemView + g_Off.m_iDefIndex), &defIndex, sizeof(defIndex), nullptr);
+            WriteMem(h, itemView + g_Off.m_iDefIndex, defIndex);
 
             if (g_Off.m_nFallbackPaint) {
                 int32_t zero = 0;
-                WriteProcessMemory(h, (void*)(itemView + g_Off.m_nFallbackPaint), &zero, sizeof(zero), nullptr);
+                WriteMem(h, itemView + g_Off.m_nFallbackPaint, zero);
             }
         }
 
         if (g_Off.m_bNeedReapply) {
             bool reapply = true;
-            WriteProcessMemory(h, (void*)(hero + g_Off.m_bNeedReapply), &reapply, sizeof(reapply), nullptr);
+            WriteMem(h, hero + g_Off.m_bNeedReapply, reapply);
         }
 
-        CloseHandle(h);
+        CloseProcHandle(h);
         return true;
     }
 }

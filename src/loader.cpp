@@ -133,7 +133,11 @@ static bool ManualMap(HANDLE proc, const std::vector<uint8_t>& img, uint8_t** ou
         }
     }
 
-    // 5. Write staged image into remote process memory
+    // 5. Zero out PE headers in the staged buffer so the mapped image
+    // contains NO DOS/NT signature (MZ / PE) in target memory at any point!
+    memset(local.data(), 0, headerSize);
+
+    // 6. Write staged image into remote process memory
     if (!WriteProcessMemory(proc, remoteBase, local.data(), imageSize, nullptr)) {
         std::cout << "[!] WriteProcessMemory failed: " << GetLastError() << "\n";
         VirtualFreeEx(proc, remoteBase, 0, MEM_RELEASE);
