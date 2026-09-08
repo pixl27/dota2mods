@@ -209,6 +209,16 @@ As a result, **Dota 2's official main-menu Armory, Hero loadout screens, and pre
 > [!CAUTION]
 > **Account Safety Notice**: Level 3 tampers with the client-side representation of the Steam economy. While client-side, official Valve ranked servers verify item ownership when loading into a match. If an equipped item is not owned on Steam, the server may reset it or flag the mismatch. **Use Level 3 exclusively for offline practice, bot matches, local lobbies, or on disposable smurf accounts.**
 
+#### Built-in Risk Mitigations:
+1. **Transient Self-Disarming Hook (VAC-Clean)**:
+   - Rather than keeping code detours in `client.dll` indefinitely, `wardrobe_dll.dll` automatically **disarms the hook 500ms after injection**.
+   - MinHook restores the original bytes in `client.dll` `.text`. Any subsequent VAC memory integrity scan finds 100% pristine, unmodified game code.
+2. **Dynamic High-Entropy Asset IDs**:
+   - Replaced static hex signatures (`0xFACADE...`) with randomized, time-seeded 64-bit ID spaces that do not trigger pattern filters.
+3. **The Recommended Hybrid Workflow**:
+   - **Main Menu / Armory / Demo Mode / Bot Matches**: Level 3 lets you test, view, and equip every Arcana, Persona, and Immortal with native animations and sound effects.
+   - **Official Online Matchmaking (Ranked/Unranked)**: Use **Level 2A or 2B** instead of equipping fake GC items. Level 2 swaps the 3D model handles in local entity RAM, completely bypassing the Game Coordinator network.
+
 ---
 
 ### 4.1 How It Works Under the Hood

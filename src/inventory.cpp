@@ -80,7 +80,26 @@ static std::vector<uint8_t> FakeEconItem(uint64_t fakeId, int defIndex, const st
 // gc_hook.txt (see dump_offsets.py). Protobuf repeated fields concatenate
 // cleanly, so we extend the buffer, then call the original.
 
-static uint64_t g_NextFakeId = 0xFACADE00000000ULL;  // high range, never collides w/ real IDs
+#include <chrono>
+#include <thread>
+#include <atomic>
+
+extern void DisableGCHook();
+
+static std::atomic<bool> g_AutoUnhookEnabled{ true };
+static std::atomic<bool> g_Injected{ false };
+
+void SetAutoUnhook(bool enable) { g_AutoUnhookEnabled = enable; }
+bool IsAutoUnhookEnabled() { return g_AutoUnhookEnabled; }
+bool HasInjected() { return g_Injected; }
+
+static uint64_t InitBaseId() {
+    uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    // High range non-colliding dynamic ID without static signatures
+    return (1ULL << 62) | (now << 24);
+}
+static uint64_t g_NextFakeId = 0;
 
 // Build the full appended blob: serialized SingleObjects for every skin in g_DB.
 // Called once at boot (DB is static), cached, appended to every Welcome/Cache msg.
@@ -92,6 +111,7 @@ void BuildInjectBlob() {
     std::lock_guard<std::mutex> lk(g_InjectMutex);
     g_InjectBlob.clear();
     g_InjectCount = 0;
+    if (g_NextFakeId == 0) g_NextFakeId = InitBaseId();
     std::lock_guard<std::mutex> db(g_DbMutex);
     for (auto& s : g_DB) {
         if (s.defIndex <= 0) continue;
@@ -129,6 +149,14 @@ void __fastcall hkOnCache(void* self, void* msg, size_t len) {
             memcpy(grown + len, g_InjectBlob.data(), g_InjectBlob.size());
             oOnCache(self, grown, total);
             free(grown);
+            g_Injected = true;
+            if (g_AutoUnhookEnabled) {
+                // Post background thread to cleanly restore original client.dll .text bytes
+                std::thread([]() {
+                    Sleep(500);
+                    DisableGCHook();
+                }).detach();
+            }
             return;
         }
     }

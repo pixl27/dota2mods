@@ -197,6 +197,23 @@ static ID3D11RenderTargetView* g_RTV = nullptr;
 static bool g_Init = false, g_Show = false;
 static std::string g_Status = "idle";
 
+static void* g_GCHookTarget = nullptr;
+static std::atomic<bool> g_GCHookActive{ false };
+
+void DisableGCHook() {
+    if (g_GCHookTarget && g_GCHookActive) {
+        MH_DisableHook(g_GCHookTarget);
+        g_GCHookActive = false;
+    }
+}
+
+void EnableGCHook() {
+    if (g_GCHookTarget && !g_GCHookActive) {
+        MH_EnableHook(g_GCHookTarget);
+        g_GCHookActive = true;
+    }
+}
+
 static LRESULT CALLBACK DllWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
     if (m == WM_KEYDOWN && w == VK_INSERT) { g_Show = !g_Show; return 0; }
@@ -205,6 +222,9 @@ static LRESULT CALLBACK DllWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static void RenderInGame() {
+    extern bool HasInjected();
+    extern size_t InjectItemCount();
+
     ImGui::Begin("wardrobe — live", &g_Show, ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::Text("status: %s", g_Status.c_str());
     ImGui::Text("hero: %s", g_ForcedHero.empty() ? "(none pushed yet)" : g_ForcedHero.c_str());
@@ -215,6 +235,28 @@ static void RenderInGame() {
     if (ImGui::Button("re-push current hero") && !g_ForcedHero.empty()) {
         g_Status = PushHero(g_ForcedHero) ? "pushed ok" : "push failed";
     }
+
+    ImGui::Separator();
+    ImGui::Text("Level 3 (GC Inventory Unlock):");
+    if (HasInjected()) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Inventory: Injected (%llu items)",
+            (unsigned long long)InjectItemCount());
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Inventory: Waiting for GC packet...");
+    }
+
+    if (g_GCHookActive) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "GC Hook: Active in client.dll");
+        if (ImGui::Button("Unhook GC (VAC-Clean)")) {
+            DisableGCHook();
+        }
+    } else {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "GC Hook: Disarmed (Clean client.dll)");
+        if (g_GCHookTarget && ImGui::Button("Re-arm GC Hook")) {
+            EnableGCHook();
+        }
+    }
+
     ImGui::TextDisabled("INSERT toggles • loadout comes from wardrobe.exe");
     ImGui::End();
 }
@@ -440,8 +482,12 @@ DWORD WINAPI MainThread(LPVOID mod) {
         }
         if (rva && g_ClientBase) {
             void* target = (void*)(g_ClientBase + rva);
-            MH_CreateHook(target, &hkOnCache, (void**)GetOnCacheOrigSlot());
-            MH_EnableHook(target);
+            if (MH_CreateHook(target, &hkOnCache, (void**)GetOnCacheOrigSlot()) == MH_OK) {
+                if (MH_EnableHook(target) == MH_OK) {
+                    g_GCHookTarget = target;
+                    g_GCHookActive = true;
+                }
+            }
         }
     }
 
