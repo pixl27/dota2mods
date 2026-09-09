@@ -3,7 +3,6 @@
 #include <set>
 #include "overlay.h"
 #include "gamestate.h"
-#include "stealth.h"
 
 Config g_Cfg;
 std::vector<SkinEntry> g_DB;
@@ -154,7 +153,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     if (g_DB.empty()) LoadDB("build/data/skins_full.json");
     if (g_DB.empty()) LoadDB("skins_full.json");
     LoadLoadout("loadout.json");
-    stealth::LoadOffsets();
 
     std::thread(GSIThread).detach();
     MakeOverlay(inst);
@@ -175,7 +173,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
             }
         }
 
-        bool insertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+        // END, not INSERT: the in-game HUD of wardrobe_dll.dll already uses INSERT.
+        bool insertDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
         if (insertDown && !prevInsert) {
             g_MenuOpen = !g_MenuOpen;
         }

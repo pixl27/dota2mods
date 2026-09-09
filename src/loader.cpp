@@ -6,6 +6,7 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
+#include "wardrobe_session.h"
 
 static DWORD FindPid(const char* exe) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -13,7 +14,7 @@ static DWORD FindPid(const char* exe) {
     PROCESSENTRY32 pe{ sizeof(pe) };
     DWORD out = 0;
     if (Process32First(snap, &pe)) do {
-        if (!_stricmp(pe.szExeFile, exe)) { out = pe.th32ProcessId; break; }
+        if (!_stricmp(pe.szExeFile, exe)) { out = pe.th32ProcessID; break; }
     } while (Process32Next(snap, &pe));
     CloseHandle(snap);
     return out;
@@ -152,7 +153,7 @@ static bool ManualMap(HANDLE proc, const std::vector<uint8_t>& img, uint8_t** ou
 static void SyncConfigToTemp() {
     CreateDirectoryA("C:\\Temp", nullptr);
     CreateDirectoryA("C:\\Temp\\opencode", nullptr);
-    const char* files[] = { "offsets.bin", "gc_hook.txt", "skins_full.json" };
+    const char* files[] = { "skins_full.json" };
     const char* alt_prefixes[] = { "", "build/", "data/", "build/data/" };
     for (auto file : files) {
         std::string dest = std::string("C:\\Temp\\opencode\\") + file;
@@ -176,6 +177,11 @@ int main(int argc, char** argv) {
 
     DWORD pid = FindPid("dota2.exe");
     if (!pid) { std::cout << "[!] start Dota 2 first, then run map.exe.\n"; return 1; }
+    if (HasWardrobeSession(pid)) {
+        std::cout << "[!] Wardrobe is already loaded in Dota PID " << pid
+            << ". Use INSERT, or close Dota completely before loading another build.\n";
+        return 2;
+    }
 
     HANDLE proc = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
         | PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD, FALSE, pid);

@@ -8,7 +8,6 @@
 #include <sstream>
 #include "overlay.h"
 #include "gamestate.h"
-#include "stealth.h"
 #pragma comment(lib, "ws2_32.lib")
 
 static char g_HeroSearch[64] = {};
@@ -73,42 +72,12 @@ static std::string PrettyHero(const std::string& key) {
     return res.empty() ? key : res;
 }
 
-// push current loadout to the in-game DLL over localhost:3999. Silent if DLL not mapped.
-static void PushLive(const std::string& hero) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return;
-
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = htons(3999);
-    if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) {
-        closesocket(s);
-        return;
-    }
-    std::string msg = "HERO:" + hero + "\n";
-    {
-        std::lock_guard<std::mutex> lk(g_LoadoutMutex);
-        auto it = g_Loadout.find(hero);
-        if (it != g_Loadout.end()) {
-            for (auto& [slot, def] : it->second) {
-                msg += slot + "=" + std::to_string(def) + "\n";
-            }
-        }
-    }
-    send(s, msg.c_str(), (int)msg.size(), 0);
-    shutdown(s, SD_SEND);
-    closesocket(s);
-}
-
 static void Equip(const std::string& hero, const std::string& slot, int def) {
     {
         std::lock_guard<std::mutex> lk(g_LoadoutMutex);
         g_Loadout[hero][slot] = def;
     }
     SaveLoadout("loadout.json");
-    PushLive(hero);
-    if (g_Cfg.stealthWriter) stealth::PushLoadout(hero);
     g_Flash = "equipped def " + std::to_string(def) + " -> " + hero + " [" + slot + "]";
     g_FlashUntil = GetTickCount() + 2500;
 }
@@ -282,14 +251,12 @@ void DrawWardrobe() {
     ImGui::Columns(1);
 
     ImGui::Separator();
-    ImGui::Checkbox("stealth writer live-push", &g_Cfg.stealthWriter);
-    ImGui::SameLine();
     if (ImGui::Button("save all")) SaveLoadout("loadout.json");
     ImGui::SameLine();
     if (ImGui::Button("close overlay")) g_MenuOpen = false;
     ImGui::SameLine();
     if (ImGui::Button("exit app")) PostQuitMessage(0);
 
-    ImGui::TextDisabled("INSERT toggles • gold=immortal green=arcana");
+    ImGui::TextDisabled("END toggles • gold=immortal green=arcana");
     ImGui::End();
 }

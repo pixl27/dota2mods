@@ -1,5 +1,9 @@
 // src/overlay.h
 #pragma once
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
 #include <Windows.h>
 #include <d3d11.h>
 #include <dwmapi.h>

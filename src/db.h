@@ -14,7 +14,6 @@ struct SkinEntry {
 };
 
 struct Config {
-    bool stealthWriter = false;
     bool streamproof = true;
     int  gsiPort = 3000;
     std::string gsiToken = "wardrobe-local-token";
