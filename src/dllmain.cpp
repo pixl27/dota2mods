@@ -71,6 +71,9 @@ static void RenderInGame() {
     const auto& native = cachedNative; const auto& inventory = cachedInventory;
     ImGui::PushTextWrapPos(ImGui::GetFontSize() * 65);
     ImGui::TextWrapped("%s", appearance::PhaseText(native.phase));
+    if (native.profileDetail[0])
+        ImGui::TextDisabled("Profil client.dll : %s%s", native.profileDetail,
+            native.profileMoved ? " (adresses retrouvées après une mise à jour)" : "");
     if (native.hero) {
         ImGui::TextDisabled("Héros: %u | objets résolus: %u/%u | mises à jour: %llu",
             native.hero, native.matched, native.expected, (unsigned long long)native.rebuilds);

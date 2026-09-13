@@ -25,5 +25,13 @@ cl /nologo /EHsc /W4 /std:c++17 /utf-8 /Isrc tests\native_appearance_test.cpp /F
 if errorlevel 1 exit /b 1
 build\native_appearance_test.exe
 if errorlevel 1 exit /b 1
+cl /nologo /EHsc /W4 /std:c++17 /utf-8 /Isrc tests\resolver_against_client.cpp /Fo:build\resolver_against_client.obj /Fe:build\resolver_against_client.exe advapi32.lib
+if errorlevel 1 exit /b 1
+REM Checks the recorded profile against the installed Dota: first as recorded, then
+REM with every recorded address blanked so each entry goes through its search path.
+build\resolver_against_client.exe
+if errorlevel 1 exit /b 1
+build\resolver_against_client.exe -blank-hints
+if errorlevel 1 exit /b 1
 python tests\test_inventory_cache_repair.py
 exit /b %ERRORLEVEL%

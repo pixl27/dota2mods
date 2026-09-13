@@ -59,10 +59,15 @@ if errorlevel 1 (
 REM 3. The Steam GC receiver uses the public interface; no client.dll RVA is needed.
 echo [*] Using Steam GC receiver v6 with econ-cache isolation and equip notifications.
 REM 3b. Warn early when Dota's client.dll no longer matches the verified appearance profile.
-set "VERIFY=verify_profile.py"
-if not exist "!VERIFY!" set "VERIFY=build\verify_profile.py"
+set "VERIFY=refresh_profile.py"
+if not exist "!VERIFY!" set "VERIFY=build\refresh_profile.py"
 where python >nul 2>nul
-if not errorlevel 1 if exist "!VERIFY!" python "!VERIFY!"
+if not errorlevel 1 if exist "!VERIFY!" python "!VERIFY!" --check
+if not errorlevel 1 goto :profile_ok
+if not exist "!VERIFY!" goto :profile_ok
+echo [*] The appearance profile could not be checked here. The DLL re-locates it by
+echo     itself at load; press INSERT in Dota to see whether it succeeded.
+:profile_ok
 
 REM 4. Map the DLL into dota2.exe
 echo [*] Injecting wardrobe_dll.dll into dota2.exe...

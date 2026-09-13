@@ -83,7 +83,7 @@ Level 1 operates purely as an external HUD layer. It has zero process surface on
 3. The Wardrobe window will appear over your screen.
 
 ### Controls & Features:
-- **Toggle Visibility**: Press <kbd>END</kbd> on your keyboard to toggle the overlay menu (<kbd>INSERT</kbd> toggles the in-game HUD of the DLL).
+- **Everything now lives in `build\Wardrobe.exe`.** Launch it and the home screen states what is ready, what is not, and offers the one action that applies. <kbd>INSERT</kbd> still opens the diagnostic HUD inside the game.
 - **Pass-Through Click**: When closed, the window is completely transparent to mouse and keyboard input. You can play your match without interference.
 - **Stream-Proof**: Enabled by default (`WDA_EXCLUDEFROMCAPTURE`). Discord screenshare, OBS Studio, and Twitch Studio will not capture or display the overlay.
 - **Hero Auto-Detection**: When you enter a match, GSI sends real-time game telemetry over local port 3000. Wardrobe automatically detects your active hero and switches to their loadout page.
@@ -221,7 +221,8 @@ Without `--repair`, this is read-only. Repair recognizes generated IDs together
 with their account and known item definitions, verifies a backup, then removes
 only affected cache files so Steam can supply a fresh cache on the next game
 connection. Clean caches and unknown formats are preserved. Backups and hashes
-are kept under `%LOCALAPPDATA%\Wardrobeecovery\<timestamp>` (`--list-backups`, `--restore latest`). A visible item in a `.soc` cache
+are kept under `%LOCALAPPDATA%\Wardrobe
+ecovery\<timestamp>` (`--list-backups`, `--restore latest`). A visible item in a `.soc` cache
 does not prove the DLL is running or that the account owns it.
 
 ### 4.4 Packet format and regression tests
@@ -288,6 +289,14 @@ Wardrobe incorporates multiple layers of security to ensure safety during use:
 
 ### Q: Dota 2 released a patch. What do I need to redo?
 - `python update_db.py` rebuilds `data\skins_full.json` from the new game files, then run `build.bat`.
-- `python verify_profile.py` tells whether `client.dll` still matches the in-game appearance profile
-  (`src\native_appearance_profile.h`). The GC inventory keeps working after a patch; in-game appearance
-  stays disabled until the profile is re-verified for the new binary.
+- In-game appearance usually needs nothing. The DLL re-locates every `client.dll` function and offset
+  at load, by masked byte signature and by the instruction that carries each value, so a patch that only
+  moves code keeps working. Press <kbd>INSERT</kbd>: the **Profil client.dll** line says whether it
+  resolved, and names the entry it could not find otherwise.
+- If it does name one, `python refresh_profile.py` re-locates the profile in the new binary using string
+  and call-graph anchors and regenerates `src\native_appearance_profile.h`; then run `build.bat`.
+  `python refresh_profile.py --check` answers the question without writing anything, and stays quiet
+  about the addresses a patch moves; it only complains when a struct offset or a vtable slot changed.
+- Regenerating stops rather than record a value that moved, and prints each one with its kind. In the
+  Wardrobe window the Journal then offers **Enregistrer quand meme**; from a console, re-run with
+  `--accept-changes`.

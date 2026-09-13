@@ -9,7 +9,7 @@ then from the Steam library folders. Exit code 0 = match, 1 = mismatch
 (Dota updated: in-game appearance is disabled until the profile is re-verified),
 2 = client.dll or the profile could not be found.
 """
-import hashlib, os, re, subprocess, sys
+import hashlib, os, re, sys
 
 def profile_hash():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -21,17 +21,15 @@ def profile_hash():
     return None
 
 def from_running_dota():
+    """The running game's client.dll, via dota_vpk's process lookup."""
     try:
-        out = subprocess.run(["wmic", "process", "where", "name='dota2.exe'", "get", "ExecutablePath"],
-                             capture_output=True, text=True, timeout=10).stdout
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import dota_vpk
+        game = dota_vpk.game_directory()
     except Exception:
         return None
-    for line in out.splitlines():
-        line = line.strip()
-        if line.lower().endswith("dota2.exe"):
-            return os.path.join(os.path.dirname(line), "client.dll") if os.path.basename(os.path.dirname(line)).lower() == "win64" \
-                else os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(line))), "dota", "bin", "win64", "client.dll")
-    return None
+    return os.path.join(game, "bin", "win64", "client.dll") if game else None
+
 
 def from_steam_libraries():
     roots = []
@@ -68,11 +66,13 @@ def main():
         for chunk in iter(lambda: f.read(1 << 20), b""): digest.update(chunk)
     actual = digest.hexdigest()
     if actual == expected:
-        print(f"[OK] {path} matches the verified appearance profile"); return 0
-    print(f"[!] {path} does not match the appearance profile.")
+        print(f"[OK] {path} is exactly the build the appearance profile was recorded from"); return 0
+    print(f"[!] {path} is not the build the profile was recorded from.")
     print(f"    expected {expected}\n    actual   {actual}")
-    print("    Dota was updated: the GC inventory still works, but in-game appearance stays disabled")
-    print("    until the RVAs in src/native_appearance_profile.h are re-verified for this build.")
+    print("    This is normal after a Dota update and usually needs nothing: the DLL re-locates")
+    print("    every function and offset in the new binary on its own, and the INSERT panel says")
+    print("    whether it did. Run  python refresh_profile.py --check  for the detailed answer,")
+    print("    and  python refresh_profile.py  (then build.bat) if it reports an unresolved entry.")
     return 1
 
 if __name__ == "__main__":

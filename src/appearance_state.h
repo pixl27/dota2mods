@@ -50,23 +50,36 @@ inline uint64_t HeroFingerprint(const Snapshot& snapshot, uint32_t hero) {
 // Game-thread scheduler: changing another hero, repeated acknowledgements and
 // rapid clicks must not rebuild the current model every frame.
 class Scheduler {
-    uint64_t entity_ = 0, fingerprint_ = 0, due_ = 0;
+    uint64_t entity_ = 0, fingerprint_ = 0, due_ = 0, healthySince_ = 0, retryAfter_ = 0;
     bool complete_ = false;
     unsigned attempts_ = 0, resyncs_ = 0;
 public:
     static constexpr unsigned MaxAttempts = 4, MaxResyncs = 3;
+    static constexpr uint64_t HealthyMs = 3000, RecoveryCooldownMs = 30000;
+    void Reset() { *this = Scheduler{}; }
     bool Observe(uint64_t entity, uint64_t fingerprint, uint64_t now) {
         if (entity_ == entity && fingerprint_ == fingerprint) return false;
         entity_ = entity; fingerprint_ = fingerprint; due_ = now + 75;
-        complete_ = false; attempts_ = 0; resyncs_ = 0; return true;
+        complete_ = false; attempts_ = 0; resyncs_ = 0;
+        healthySince_ = retryAfter_ = 0; return true;
     }
     // The server owns the networked model: the end of a transformation or a
-    // full entity update can replace the committed outfit. Re-apply it a
-    // bounded number of times per outfit so a persistent mismatch cannot loop.
+    // full entity update can replace the committed outfit. Use bounded bursts
+    // per failure episode. A healthy outfit restores the budget;
+    // persistent failures get a cooldown, never a permanent lifetime lockout.
     bool Retry(uint64_t now) {
-        if (!complete_ || resyncs_ >= MaxResyncs) return false;
+        healthySince_ = 0;
+        if ((!complete_ && !Exhausted()) || now < retryAfter_) return false;
+        if (resyncs_ >= MaxResyncs) resyncs_ = 0;
+        retryAfter_ = resyncs_ + 1 == MaxResyncs ? now + RecoveryCooldownMs : 0;
         ++resyncs_; complete_ = false; attempts_ = 0; due_ = now + 75; return true;
     }
+    void Healthy(uint64_t now) {
+        if (!complete_) return;
+        if (!healthySince_) healthySince_ = now;
+        if (now - healthySince_ >= HealthyMs) { resyncs_ = 0; retryAfter_ = 0; }
+    }
+    void Unhealthy() { healthySince_ = 0; }
     unsigned Resyncs() const { return resyncs_; }
     bool Begin(uint64_t now) {
         if (!entity_ || complete_ || attempts_ >= MaxAttempts || now < due_) return false;

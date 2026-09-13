@@ -22,21 +22,41 @@ FIRST TIME (10 min, once):
      Steam\steamapps\common\dota 2 beta\game\dota\cfg\gamestate_integration\
    (create the folder if missing)
 
-OVERLAY ONLY (wardrobe preview + loadout staging):
-1. Start Dota 2.
-2. Run build\wardrobe.exe. No admin. No injection.
-3. Overlay appears. END toggles it (INSERT belongs to the in-game HUD).
-4. Left column: pick hero. Right: open slot, click skin, equipped.
-   "wear: <set>" = whole outfit in one click.
-5. Loadout auto-saves to loadout.json.
+USAGE (tout se fait depuis l'application):
+1. Lance build\Wardrobe.exe. Pas d'admin, pas d'installation.
+2. L'ecran d'accueil dit ou en est chaque element et propose la seule action
+   utile du moment : lancer Dota 2, puis activer Wardrobe.
+3. Equipe tes objets dans le menu natif de Dota, puis lance une partie.
+4. INSERT en jeu ouvre le panneau de diagnostic de la DLL.
 
-EQUIPEMENT NATIF EN PARTIE (v6, apparence locale):
-1. Lance Dota, puis launch_level3.bat une fois pour cette session.
-2. Equipe les objets dans le menu natif de Dota.
-3. Choisis ton heros en partie locale. La tenue est transmise au moteur
-   automatiquement, avec regroupement des clics rapides.
-4. INSERT affiche l'etat de l'inventaire et celui de l'apparence en partie.
-   Aucun offsets.bin, second navigateur de tenues ou re-push manuel requis.
+L'onglet Entretien regroupe ce qui etait dans les .bat et les scripts Python :
+mise a jour du catalogue, verification et regeneration du profil client.dll,
+recompilation, restauration du cache Steam. L'onglet Journal montre en clair ce
+que chaque operation a fait, avec la commande exacte qui a ete lancee.
+
+L'activation n'est declaree reussie que lorsque l'application constate
+elle-meme que la bibliotheque est chargee dans le jeu, jamais sur la seule
+foi du code de retour du chargeur.
+
+launch_level3.bat reste disponible pour qui prefere la ligne de commande.
+L'ancien navigateur de tenues (wardrobe.exe) n'est plus construit : son
+loadout.json n'etait lu par personne, l'equipement passant par le menu de Dota.
+
+DONNER LE TOUT A QUELQU'UN:
+1. build.bat, puis  python package.py
+2. Envoie le fichier build\Wardrobe-<date>.zip (environ 1,4 Mo).
+3. En face : decompresser, lancer Wardrobe.exe. Rien a installer, pas d'admin.
+   Les binaires n'importent que des DLL Windows : aucun redistribuable
+   Visual C++ n'est necessaire, et package.py refuse de packager si ce
+   n'etait plus vrai.
+   Windows SmartScreen avertira (programme non signe) et l'antivirus peut
+   reagir : le programme charge du code dans Dota 2.
+   Dota 2 est protege par VAC. Charger du code dans le jeu est exactement ce
+   qu'un anti-triche cherche ; un compte peut etre sanctionne. Le LISEZMOI.txt
+   inclus dans le paquet le dit noir sur blanc.
+4. Le paquet embarque le catalogue et le profil client.dll. Si le Dota d'en
+   face est d'une autre version, la DLL relocalise le profil toute seule au
+   chargement ; c'est le but de src/native_appearance_resolver.h.
 
 NOTES:
 - GC inventory + local equip receiver v6: restart Dota if an older DLL was loaded, then run
@@ -49,6 +69,11 @@ NOTES:
   never precached are registered in Dota's just-in-time manifest before loading,
   otherwise the engine draws models/dev/error.vmdl. INSERT shows the model Dota
   actually renders two seconds after each outfit update.
+  Appearance recovery preserves temporary ability forms, restores the outfit
+  on returning to the base form, and reloads resources after reconnects.
+  Repeated failures use a cooldown; they no longer disable recovery after
+  three repairs for the entire outfit. These changes have offline regression
+  coverage; visual verification in a live match is still required.
   Equip items in Dota's native loadout screen. The receiver stays active after
   refresh; INSERT shows accepted/completed equips, pending replies, and latency.
   Receiver v4 notifies Dota immediately when a local reply is ready, preserves
@@ -63,14 +88,26 @@ NOTES:
   Receiver v6 isolates econ service 1, prevents duplicate loading, and resumes
   an already delivered inventory without reloading the full cosmetic catalog.
 - Regression checks: tests\run_tests.bat. Noninteractive build: build.bat --no-pause.
-- After a Dota update: python verify_profile.py tells whether client.dll still matches
-  the appearance profile (launch_level3.bat runs it automatically when Python exists).
+- After a Dota update: usually nothing to do. The DLL re-locates every client.dll
+  function and offset it needs at load time, by masked byte signature and by the
+  instruction that carries each value, so moved code keeps working without a rebuild.
+  Press INSERT: the panel line "Profil client.dll" says whether it resolved, and
+  names the entry it could not find if it did not. Only then run
+    python refresh_profile.py     (then build.bat)
+  It stops rather than record a value that moved, and prints each one with its kind;
+  re-run with --accept-changes, or press "Enregistrer quand meme" in Wardrobe's Journal.
+  launch_level3.bat runs "refresh_profile.py --check" for you when Python is present.
+  That check ignores the addresses a patch moves and warns only on an ABI change.
 - Logs in C:\Temp\opencode rotate to *.old once they pass 4 MB.
 - The preview overlay uses Game State Integration telemetry. Global cosmetics
   (loading screens, HUD skins, music, terrains, cursor packs, announcers) are in
   the catalog and equip natively; they are client-side in Dota, so they should
   apply in local lobbies, but that path has not been verified in game yet.
-- wardrobe_dll.dll = live swap. map.exe ONLY — never double-click the DLL,
-  never LoadLibrary it. A changed Dota binary disables the native appearance profile.
+- wardrobe_dll.dll = the in-game payload. The application loads it through
+  map.exe; never double-click it and never LoadLibrary it. An entry the resolver
+  cannot find disables the native appearance profile rather than letting a hook
+  land on the wrong function.
+- Wardrobe.exe --capture shot.png [--page 0|1|2] saves a picture of the window,
+  for a bug report.
 - Streamproof is ON: OBS/Discord won't capture the menu.
 - The local hero game thread handles appearance updates; the old keeper/TCP writer was removed from the DLL.

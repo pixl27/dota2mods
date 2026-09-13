@@ -11,6 +11,7 @@
 #include "appearance_state.h"
 #include "native_appearance.h"
 #include "native_appearance_profile.h"
+#include "native_appearance_resolver.h"
 #include "diagnostics.h"
 #include "../thirdparty/minhook/include/MinHook.h"
 #pragma comment(lib, "bcrypt.lib")
@@ -49,14 +50,15 @@ struct PointerList { int32_t count, padding; void** data; };
 // and type hashes. Callers zero it before the engine fills the hashes.
 struct alignas(8) ResourceName { int32_t length = 0; uint32_t allocated = 0xc00000c8; char storage[0xc8]{}; uint64_t hash = 0, type = 0; };
 static_assert(sizeof(ResourceName) == 0xe0, "Current CResourceNameTyped ABI");
-constexpr uint32_t ModelResourceType = 0x6c646d76; // 'vmdl'
 std::array<char, 264> baselineModel{};
+std::array<std::string, 1000> heroBaselines;
 uint64_t baselineEntity = 0;
 struct StagedOutfit {
     NativeVector list{};
     void* modifiers = nullptr;
     std::vector<std::string> paths;
     std::vector<void*> models;
+    std::string sourceModel;
     uint64_t started = 0;
 } staged;
 // After a commit, read back which model the entity actually renders, then
@@ -64,22 +66,39 @@ struct StagedOutfit {
 // transformation or a full entity update can put the classic model back.
 uint64_t verifyAt = 0, checkAt = 0;
 constexpr uint64_t VerifyDelayMs = 2000, CheckIntervalMs = 500;
-std::vector<std::string> committedStems;
+std::vector<std::string> committedPaths;
+std::vector<void*> committedModels;
+std::string committedBase;
+uint64_t lastLocalThink = 0, trackedEntity = 0, spawnEntity = 0, spawnGeneration = 0, seenSpawnGeneration = 0;
+void* trackedHero = nullptr;
+constexpr uint64_t SessionGapMs = 5000;
+bool ModelMatches(const char* name, const std::string& path) {
+    if (!name || !*name || path.empty()) return false;
+    if (path == name) return true;
+    auto stem = path;
+    if (stem.size() >= 5 && stem.compare(stem.size() - 5, 5, ".vmdl") == 0) stem.resize(stem.size() - 5);
+    const std::string prefix = stem + "_c_";
+    return !strncmp(name, prefix.c_str(), prefix.size());
+}
+bool ErrorModel(const char* name) { return name && ModelMatches(name, "models/dev/error.vmdl"); }
 void RememberCommitted(const std::vector<std::string>& paths) {
-    committedStems.clear();
-    for (auto stem : paths) {
-        const auto extension = stem.rfind(".vmdl");
-        if (extension != std::string::npos && extension + 5 == stem.size()) stem.erase(extension);
-        if (!stem.empty()) committedStems.push_back(std::move(stem));
-    }
+    committedPaths = paths;
+    committedBase = paths.empty() ? "" : paths.front();
 }
 // Combined meshes are named after their base ("<base>_c_<n>.vmdl") and a
 // transformation switches to another replacement of the same outfit; both
 // count as ours. Anything else, including models/dev/error.vmdl, does not.
 bool RenderMatchesCommitted(const char* name) {
-    if (!*name || committedStems.empty()) return true;
-    for (const auto& stem : committedStems) if (!strncmp(name, stem.c_str(), stem.size())) return true;
+    if (!*name || committedPaths.empty()) return false;
+    for (const auto& path : committedPaths) if (ModelMatches(name, path)) return true;
     return false;
+}
+// Unfamiliar models can be hex, shapeshift or another legitimate ability.
+// Only the captured base, the selected base and an error model authorize a
+// reconstruction. In particular a dragon must never be rebuilt as a human.
+bool TemporaryForm(const char* name) {
+    return *name && !ErrorModel(name) && baselineModel[0] &&
+        !ModelMatches(name, baselineModel.data()) && !ModelMatches(name, committedBase);
 }
 using ThinkFn = void(__fastcall*)(void*);
 using PlayerInventoryFn = void*(__fastcall*)(void*, int32_t, bool);
@@ -89,6 +108,22 @@ using DefaultFn = void*(__fastcall*)(void*, uint32_t, uint32_t);
 using BuildListFn = void(__fastcall*)(void*, void*, void*, NativeVector*);
 using WearablePlayerFn = int32_t*(__fastcall*)(void*, int32_t*);
 uintptr_t base = 0;
+// tier0 does not export the allocator by name; client.dll reaches it through an
+// import slot, and both of its allocation thunks jump straight into the interface.
+void* MemoryInterface() {
+    const auto imported = *reinterpret_cast<void**>(base + profile::MemAllocImport);
+    return imported ? *reinterpret_cast<void**>(imported) : nullptr;
+}
+void* __fastcall EngineAllocate(size_t bytes) {
+    const auto memory = MemoryInterface();
+    if (!memory) return nullptr;
+    return reinterpret_cast<void*(__fastcall*)(void*, size_t)>((*static_cast<void***>(memory))[profile::MemAllocSlot])(memory, bytes);
+}
+void __fastcall EngineFree(void* block) {
+    const auto memory = MemoryInterface();
+    if (memory) reinterpret_cast<void(__fastcall*)(void*, void*)>((*static_cast<void***>(memory))[profile::MemFreeSlot])(memory, block);
+}
+uintptr_t LocalInventory() { return base + profile::InventoryManager + profile::LocalInventoryOffset; }
 ThinkFn originalThink = nullptr;
 PlayerInventoryFn originalPlayerInventory = nullptr;
 EquippedFn originalEquipped = nullptr;
@@ -143,25 +178,6 @@ bool DiskMatches(HMODULE module) {
     return ok && std::strcmp(hex, profile::Sha256) == 0;
 }
 
-bool MemoryMatches() {
-    __try {
-        auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096) return false;
-        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-        return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
-            nt->FileHeader.TimeDateStamp == profile::Timestamp && nt->OptionalHeader.SizeOfImage == profile::ImageSize &&
-            !memcmp(reinterpret_cast<void*>(base + profile::Think), profile::ThinkBytes, sizeof(profile::ThinkBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::GatherNetwork), profile::NetworkBytes, sizeof(profile::NetworkBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::GatherInventory), profile::InventoryBytes, sizeof(profile::InventoryBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::InventoryForPlayer), profile::PlayerInventoryBytes, sizeof(profile::PlayerInventoryBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::BuildWearableList), profile::BuildListBytes, sizeof(profile::BuildListBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::BuildSpawnWearableList), profile::SpawnListBytes, sizeof(profile::SpawnListBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::PrepareWearables), profile::PrepareBytes, sizeof(profile::PrepareBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::CreateWearables), profile::CreateBytes, sizeof(profile::CreateBytes)) &&
-            !memcmp(reinterpret_cast<void*>(base + profile::EquippedView), profile::EquippedBytes, sizeof(profile::EquippedBytes));
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-
 bool LocalHero(void* hero, uint64_t steamId, uint32_t& heroId, uint32_t& handle) {
     __try {
         const auto controller = *reinterpret_cast<uintptr_t*>(base + profile::LocalController);
@@ -173,8 +189,8 @@ bool LocalHero(void* hero, uint64_t steamId, uint32_t& heroId, uint32_t& handle)
         const auto index = handle & 0x7fff;
         const auto chunk = *reinterpret_cast<uintptr_t*>(chunks + (index >> 9) * sizeof(uintptr_t));
         if (!chunk) return false;
-        const auto identity = chunk + (index & 0x1ff) * 0x70;
-        if (*reinterpret_cast<uint32_t*>(identity + 0x10) != handle || *reinterpret_cast<void**>(identity) != hero) return false;
+        const auto identity = chunk + (index & 0x1ff) * profile::IdentityStride;
+        if (*reinterpret_cast<uint32_t*>(identity + profile::IdentityHandle) != handle || *reinterpret_cast<void**>(identity) != hero) return false;
         heroId = *reinterpret_cast<uint32_t*>(uintptr_t(hero) + profile::HeroId);
         return heroId > 0 && heroId < 1000;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -183,7 +199,7 @@ bool LocalHero(void* hero, uint64_t steamId, uint32_t& heroId, uint32_t& handle)
 void* __fastcall OnPlayerInventory(void* manager, int32_t player, bool local) {
     // In a match, the player-resource inventory can differ from the local
     // menu inventory. Redirect only inside our local hero appearance gather.
-    if (ActiveList()) return reinterpret_cast<void*>(base + profile::LocalInventory);
+    if (ActiveList()) return reinterpret_cast<void*>(LocalInventory());
     return originalPlayerInventory(manager, player, local);
 }
 void* __fastcall OnEquipped(void* inventory, uint32_t hero, uint32_t slot, bool ignorePreview) {
@@ -195,7 +211,7 @@ void* __fastcall OnEquipped(void* inventory, uint32_t hero, uint32_t slot, bool 
             if (!selection.item) return defaultView(reinterpret_cast<void*>(base + profile::InventoryManager), hero, slot);
             // Resolve the acknowledged 64-bit ID directly. A stale per-hero
             // loadout index must not return the preceding click's item view.
-            return findItem(reinterpret_cast<void*>(base + profile::LocalInventory), selection.item, nullptr);
+            return findItem(reinterpret_cast<void*>(LocalInventory()), selection.item, nullptr);
         }
     }
     return originalEquipped(inventory, hero, slot, ignorePreview);
@@ -209,7 +225,7 @@ bool LocalWearableOwner(void* hero, const Snapshot& snapshot, uint32_t& heroId) 
         if (!controller || !snapshot.steamId || *reinterpret_cast<uint64_t*>(controller + profile::SteamId) != snapshot.steamId) return false;
         int32_t owner = -1;
         wearablePlayer(hero, &owner);
-        if (owner < 0 || owner >= 64 || owner != *reinterpret_cast<int32_t*>(controller + 0x908)) return false;
+        if (owner < 0 || owner >= 64 || owner != *reinterpret_cast<int32_t*>(controller + profile::PlayerId)) return false;
         heroId = *reinterpret_cast<uint32_t*>(uintptr_t(hero) + profile::HeroId);
         return heroId > 0 && heroId < 1000;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -219,15 +235,19 @@ uint64_t EntityKey(void* hero, uint32_t handle) {
     return uint64_t(uintptr_t(hero)) ^ (uint64_t(handle) << 32);
 }
 void CaptureSpawnModel(void* hero, void* kv) {
-    const auto identity = *reinterpret_cast<uintptr_t*>(uintptr_t(hero) + 0x10);
+    const auto identity = *reinterpret_cast<uintptr_t*>(uintptr_t(hero) + profile::EntityIdentity);
     if (!identity || *reinterpret_cast<void**>(identity) != hero) return;
-    const auto entity = EntityKey(hero, *reinterpret_cast<uint32_t*>(identity + 0x10));
+    const auto entity = EntityKey(hero, *reinterpret_cast<uint32_t*>(identity + profile::IdentityHandle));
+    const auto heroId = *reinterpret_cast<uint32_t*>(uintptr_t(hero) + profile::HeroId);
+    if (!heroId || heroId >= heroBaselines.size()) return;
     // Capture before inventory modifiers can replace the render/base model.
     // Empty KVs from a live update must never overwrite this spawn baseline.
     const char* model = kv && engine.kvModel ? engine.kvModel(kv, nullptr) : nullptr;
-    if (model && *model) {
+    if (model && *model && !ErrorModel(model) &&
+        (heroBaselines[heroId].empty() || ModelMatches(model, heroBaselines[heroId]))) {
         strncpy_s(baselineModel.data(), baselineModel.size(), model, _TRUNCATE);
         baselineEntity = entity;
+        heroBaselines[heroId] = model;
     } else if (engine.modelHandle) CaptureBaseline(hero, entity);
 }
 void __fastcall OnSpawnList(void* hero, void* kv, void* resources, NativeVector* output) {
@@ -248,11 +268,18 @@ void __fastcall OnBuildList(void* hero, void* kv, void* resources, NativeVector*
     // Resolve everything before replacing the spawn source. Missing GC data
     // leaves Dota's original creation path intact.
     for (const auto& selection : snapshot->selections) if (selection.hero == heroId && selection.slot < 32 && selection.item) {
-        if (!findItem(reinterpret_cast<void*>(base + profile::LocalInventory), selection.item, nullptr)) {
+        if (!findItem(reinterpret_cast<void*>(LocalInventory()), selection.item, nullptr)) {
             originalBuildList(hero, kv, resources, output); return;
         }
     }
-    CaptureSpawnModel(hero, kv);
+    if (!parent) {
+        CaptureSpawnModel(hero, kv);
+        const auto identity = *reinterpret_cast<uintptr_t*>(uintptr_t(hero) + profile::EntityIdentity);
+        if (identity && *reinterpret_cast<void**>(identity) == hero) {
+            spawnEntity = EntityKey(hero, *reinterpret_cast<uint32_t*>(identity + profile::IdentityHandle));
+            ++spawnGeneration;
+        }
+    }
     ListContext context{snapshot, hero, heroId, output};
     ScopedList scope(context);
     originalBuildList(hero, kv, resources, output);
@@ -263,45 +290,60 @@ void __fastcall OnBuildList(void* hero, void* kv, void* resources, NativeVector*
 void ReleaseCreationList(NativeVector& list) {
     auto entries = reinterpret_cast<CreationEntry*>(list.data);
     for (int32_t i = 0; i < list.count; ++i) if (entries[i].owned && entries[i].view) {
-        auto destructor = reinterpret_cast<void(__fastcall*)(void*, uint32_t)>((*static_cast<void***>(entries[i].view))[2]);
+        auto destructor = reinterpret_cast<void(__fastcall*)(void*, uint32_t)>((*static_cast<void***>(entries[i].view))[profile::ViewDestructorSlot]);
         destructor(entries[i].view, 1);
     }
     if (list.data && !(uint32_t(list.flags) & 0xc0000000)) engine.free(list.data);
     list = {};
 }
 void ReleaseModifiers(void* modifiers) {
-    if (modifiers && InterlockedDecrement(reinterpret_cast<LONG*>(uintptr_t(modifiers) + 8)) == 0) {
-        auto destructor = reinterpret_cast<void(__fastcall*)(void*, uint32_t)>((*static_cast<void***>(modifiers))[0]);
+    if (modifiers && InterlockedDecrement(reinterpret_cast<LONG*>(uintptr_t(modifiers) + profile::ModifierRefCount)) == 0) {
+        auto destructor = reinterpret_cast<void(__fastcall*)(void*, uint32_t)>((*static_cast<void***>(modifiers))[profile::ModifierDestructorSlot]);
         destructor(modifiers, 1);
     }
 }
 bool CaptureBaseline(void* hero, uint64_t entity) {
     if (entity == baselineEntity && baselineModel[0]) return true;
+    const auto heroId = *reinterpret_cast<uint32_t*>(uintptr_t(hero) + profile::HeroId);
+    if (!heroId || heroId >= heroBaselines.size()) return false;
     baselineModel.fill(0);
-    void* handle = *reinterpret_cast<void**>(uintptr_t(hero) + 0x15e8);
+    // Entity handles change on reconnect. Preserve the known original model
+    // for each hero instead of learning an error/persona as the new baseline.
+    if (!heroBaselines[heroId].empty()) {
+        strncpy_s(baselineModel.data(), baselineModel.size(), heroBaselines[heroId].c_str(), _TRUNCATE);
+        baselineEntity = entity;
+        return true;
+    }
+    void* handle = *reinterpret_cast<void**>(uintptr_t(hero) + profile::BaseModel);
     if (!handle) engine.modelHandle(hero, &handle);
     const auto info = *reinterpret_cast<void**>(base + profile::ModelInfo);
     if (!info || !handle) return false;
-    auto name = reinterpret_cast<void(__fastcall*)(void*, void*, char*, uint32_t)>((*static_cast<void***>(info))[13]);
+    auto name = reinterpret_cast<void(__fastcall*)(void*, void*, char*, uint32_t)>((*static_cast<void***>(info))[profile::ModelNameSlot]);
     name(info, handle, baselineModel.data(), uint32_t(baselineModel.size()));
     baselineModel.back() = 0;
     baselineEntity = entity;
+    if (ErrorModel(baselineModel.data())) baselineModel.fill(0);
+    if (baselineModel[0]) heroBaselines[heroId] = baselineModel.data();
     return baselineModel[0] != 0;
+}
+void ReleaseModels(std::vector<void*>& models) {
+    const auto resources = *reinterpret_cast<void**>(base + profile::ResourceSystem);
+    for (auto model : models) if (model && resources &&
+        InterlockedDecrement(reinterpret_cast<LONG*>(uintptr_t(model) + profile::ModelRefCount)) == 0) {
+        auto release = reinterpret_cast<void(__fastcall*)(void*, void*)>((*static_cast<void***>(resources))[profile::ReleaseSlot]);
+        release(resources, model);
+    }
+    models.clear();
 }
 void ReleaseStaged() {
     ReleaseCreationList(staged.list);
     ReleaseModifiers(staged.modifiers);
-    const auto resources = *reinterpret_cast<void**>(base + profile::ResourceSystem);
-    for (auto model : staged.models) if (model && resources &&
-        InterlockedDecrement(reinterpret_cast<LONG*>(uintptr_t(model) + 0x20)) == 0) {
-        auto release = reinterpret_cast<void(__fastcall*)(void*, void*)>((*static_cast<void***>(resources))[2]);
-        release(resources, model);
-    }
+    ReleaseModels(staged.models);
     staged = {};
 }
 bool StageWearables(void* hero, const Snapshot& snapshot, uint32_t heroId, uint64_t now) {
     for (const auto& s : snapshot.selections) if (s.hero == heroId && s.slot < 32 && s.item &&
-        !findItem(reinterpret_cast<void*>(base + profile::LocalInventory), s.item, nullptr)) return false;
+        !findItem(reinterpret_cast<void*>(LocalInventory()), s.item, nullptr)) return false;
     auto& list = *reinterpret_cast<NativeVector*>(uintptr_t(hero) + profile::CreationList);
     auto& initialized = *reinterpret_cast<uint8_t*>(uintptr_t(hero) + profile::CreationInitialized);
     if (list.count < 0 || list.count > 64 || (list.count && !list.data) || !baselineModel[0]) return false;
@@ -310,7 +352,7 @@ bool StageWearables(void* hero, const Snapshot& snapshot, uint32_t heroId, uint6
 
     // Build an engine-owned replacement before releasing the visible outfit.
     // CEntityKeyValues is 0x38 bytes in the verified constructor/destructor.
-    alignas(8) std::array<uint8_t, 0x38> kv{}, resources{};
+    alignas(8) std::array<uint8_t, profile::KeyValuesStorage> kv{}, resources{};
     engine.kvCtor(kv.data(), nullptr, 2); engine.kvCtor(resources.data(), nullptr, 2);
     NativeVector previous = list;
     const auto wasInitialized = initialized;
@@ -324,7 +366,7 @@ bool StageWearables(void* hero, const Snapshot& snapshot, uint32_t heroId, uint6
     std::array<void*, 64> views{}; int32_t count = 0;
     auto entries = reinterpret_cast<const CreationEntry*>(staged.list.data);
     for (int32_t i = 0; i < staged.list.count; ++i) if (entries[i].view) views[count++] = entries[i].view;
-    auto modifiers = engine.allocate(0x30);
+    auto modifiers = engine.allocate(profile::ModifierStorage);
     if (!modifiers || !count) {
         if (modifiers) engine.free(modifiers);
         ReleaseStaged(); return false;
@@ -337,12 +379,12 @@ bool StageWearables(void* hero, const Snapshot& snapshot, uint32_t heroId, uint6
     // Model replacement and persona skeleton are attributes of the whole
     // outfit. Combining meshes alone cannot apply them.
     auto replacement = engine.modelOverride(hero, nullptr);
-    const char* model = replacement ? *reinterpret_cast<const char**>(uintptr_t(replacement) + 0x10) : nullptr;
+    const char* model = replacement ? *reinterpret_cast<const char**>(uintptr_t(replacement) + profile::ModifierPath) : nullptr;
     if (!model || !*model) model = baselineModel.data();
     staged.paths.emplace_back(model);
     activeModifiers = previousModifiers;
     staged.modifiers = modifiers;
-    const auto modelIndex = *reinterpret_cast<int32_t*>(uintptr_t(hero) + 0x1d0c);
+    const auto modelIndex = *reinterpret_cast<int32_t*>(uintptr_t(hero) + profile::ModelIndex);
     for (int32_t i = 0; i < count; ++i) {
         const auto path = engine.viewModel(views[i], modelIndex);
         if (path && *path) staged.paths.emplace_back(path);
@@ -354,7 +396,7 @@ bool StageWearables(void* hero, const Snapshot& snapshot, uint32_t heroId, uint6
         if (const auto replacements = static_cast<const PointerList*>(engine.entityModels(modifiers))) {
             for (int32_t i = 0; i < replacements->count && i < 64 && replacements->data; ++i) {
                 const auto entry = static_cast<const uint8_t*>(replacements->data[i]);
-                const auto path = entry ? *reinterpret_cast<const char* const*>(entry + 0x10) : nullptr;
+                const auto path = entry ? *reinterpret_cast<const char* const*>(entry + profile::ModifierPath) : nullptr;
                 if (path && *path && std::find(staged.paths.begin(), staged.paths.end(), path) == staged.paths.end())
                     staged.paths.emplace_back(path);
             }
@@ -379,7 +421,7 @@ Registration RegisterModel(const char* path) {
     ResourceName name{};
     engine.nameCtor(&name, path);
     auto result = Registration::NotModel;
-    if ((uint32_t(name.length) & 0x3fffffff) && engine.nameIsType(&name, ModelResourceType)) {
+    if ((uint32_t(name.length) & 0x3fffffff) && engine.nameIsType(&name, profile::ModelResourceType)) {
         const auto table = *static_cast<void***>(resources);
         const auto state = reinterpret_cast<int32_t(__fastcall*)(void*, ResourceName*)>(table[profile::ResourceStateSlot])(resources, &name);
         if (state) {
@@ -397,7 +439,7 @@ Registration RegisterModel(const char* path) {
 bool ModelsReady() {
     const auto info = *reinterpret_cast<void**>(base + profile::ModelInfo);
     if (!info) return false;
-    auto load = reinterpret_cast<void*(__fastcall*)(void*, void**, const char*)>((*static_cast<void***>(info))[12]);
+    auto load = reinterpret_cast<void*(__fastcall*)(void*, void**, const char*)>((*static_cast<void***>(info))[profile::FindOrLoadSlot]);
     // Spread resource requests over frames; preserve the complete old outfit
     // while Dota loads the replacement. Never wait/sleep on its render thread.
     for (unsigned budget = 0; budget < 2 && staged.models.size() < staged.paths.size(); ++budget) {
@@ -409,11 +451,18 @@ bool ModelsReady() {
           else if (registration == Registration::Known) ++status.known;
           else if (registration == Registration::Unavailable) ++status.unavailable; }
         load(info, &model, path.c_str());
-        if (model) InterlockedIncrement(reinterpret_cast<LONG*>(uintptr_t(model) + 0x20));
+        if (model) InterlockedIncrement(reinterpret_cast<LONG*>(uintptr_t(model) + profile::ModelRefCount));
         staged.models.push_back(model);
     }
     if (staged.models.size() != staged.paths.size()) return false;
-    for (auto model : staged.models) if (!model || !engine.modelReady(model)) return false;
+    for (auto model : staged.models) {
+        if (!model || !engine.modelReady(model)) return false;
+        char name[264]{};
+        reinterpret_cast<void(__fastcall*)(void*, void*, char*, uint32_t)>((*static_cast<void***>(info))[profile::ModelNameSlot])(
+            info, model, name, uint32_t(sizeof(name)));
+        name[sizeof(name) - 1] = 0;
+        if (!*name || ErrorModel(name)) return false;
+    }
     return true;
 }
 bool CommitWearables(void* hero, const Snapshot& snapshot, uint32_t heroId) {
@@ -426,7 +475,7 @@ bool CommitWearables(void* hero, const Snapshot& snapshot, uint32_t heroId) {
     list = staged.list; staged.list = {};
     *reinterpret_cast<uint8_t*>(uintptr_t(hero) + profile::CreationInitialized) = 1;
     activeModifiers = staged.modifiers; staged.modifiers = nullptr;
-    alignas(8) std::array<uint8_t, 0x38> kv{};
+    alignas(8) std::array<uint8_t, profile::KeyValuesStorage> kv{};
     engine.kvCtor(kv.data(), nullptr, 2);
     engine.destroy(hero);
     // The combiner keeps its own reference. Reset it too when leaving a
@@ -440,7 +489,7 @@ bool CommitWearables(void* hero, const Snapshot& snapshot, uint32_t heroId) {
     // Let the native combined-model path gather the newly created, persona-
     // filtered wearable entities, rather than all inventory slots together.
     *reinterpret_cast<uint8_t*>(uintptr_t(hero) + profile::DirtyFlags) |= 12;
-    return *reinterpret_cast<int32_t*>(uintptr_t(hero) + 0xad8) > 0;
+    return *reinterpret_cast<int32_t*>(uintptr_t(hero) + profile::WearableCount) > 0;
 }
 
 void RecordRenderModel(void* hero, char (&name)[264]) {
@@ -450,36 +499,62 @@ void RecordRenderModel(void* hero, char (&name)[264]) {
     if (engine.modelHandle) engine.modelHandle(hero, &handle);
     name[0] = 0;
     if (info && handle) {
-        auto text = reinterpret_cast<void(__fastcall*)(void*, void*, char*, uint32_t)>((*static_cast<void***>(info))[13]);
+        auto text = reinterpret_cast<void(__fastcall*)(void*, void*, char*, uint32_t)>((*static_cast<void***>(info))[profile::ModelNameSlot]);
         text(info, handle, name, uint32_t(sizeof(name))); name[sizeof(name) - 1] = 0;
     }
     std::lock_guard<std::mutex> lock(statusMutex);
     strcpy_s(status.renderModel, name);
 }
 void __fastcall OnThink(void* hero) {
+    originalThink(hero);
     const auto snapshot = Read();
     uint32_t heroId = 0, handle = 0;
     if (!snapshot || !LocalHero(hero, snapshot->steamId, heroId, handle) || !HeroSelections(*snapshot, heroId)) {
-        originalThink(hero); return;
+        if (hero == trackedHero) {
+            ReleaseStaged(); scheduler.Reset(); lastLocalThink = 0;
+            verifyAt = checkAt = 0;
+        }
+        return;
     }
     const auto now = GetTickCount64();
     const uint64_t entity = EntityKey(hero, handle);
+    const bool newEntity = entity != trackedEntity;
+    const bool resumed = !lastLocalThink || now - lastLocalThink > SessionGapMs;
+    const bool respawned = spawnEntity == entity && seenSpawnGeneration != spawnGeneration;
+    if (newEntity || resumed || respawned) {
+        ReleaseStaged(); scheduler.Reset(); verifyAt = checkAt = 0;
+        // Re-resolve every resource after an entity/session restart. Do not
+        // reuse a completed stage or assume the old manifest still exists.
+        ReleaseModels(committedModels);
+        if (newEntity) { committedPaths.clear(); committedBase.clear(); }
+    }
+    trackedHero = hero; trackedEntity = entity; lastLocalThink = now;
+    seenSpawnGeneration = spawnGeneration;
     const bool changed = scheduler.Observe(entity, HeroFingerprint(*snapshot, heroId), now);
     if (changed) {
-        ReleaseStaged(); verifyAt = checkAt = 0; committedStems.clear();
+        ReleaseStaged(); verifyAt = 0; checkAt = now + CheckIntervalMs;
         std::lock_guard<std::mutex> lock(statusMutex);
         status.phase = Phase::Pending; status.hero = heroId; status.revision = snapshot->revision;
         status.expected = uint32_t(HeroSelections(*snapshot, heroId)); status.matched = 0; status.attempts = 0;
     }
-    if (!staged.list.data && scheduler.Begin(now)) {
-        if (CaptureBaseline(hero, entity)) StageWearables(hero, *snapshot, heroId, now);
+    char currentName[264]{};
+    // Re-read while preparing: an ability may change form while resources load.
+    if (!scheduler.CompleteState() || (checkAt && now >= checkAt) || (verifyAt && now >= verifyAt))
+        RecordRenderModel(hero, currentName);
+    if (staged.list.data && staged.sourceModel != currentName) ReleaseStaged();
+    const bool transformed = !committedBase.empty() && TemporaryForm(currentName);
+    if (!staged.list.data && !transformed && scheduler.Begin(now)) {
+        if (CaptureBaseline(hero, entity) && StageWearables(hero, *snapshot, heroId, now))
+            staged.sourceModel = currentName;
         std::lock_guard<std::mutex> lock(statusMutex); status.attempts = scheduler.Attempts();
     }
-    if (staged.list.data && ModelsReady()) {
+    if (staged.list.data && (!TemporaryForm(currentName) || ModelMatches(currentName, staged.paths.front())) && ModelsReady()) {
         const auto begin = GetTickCount64();
         const bool rebuilt = CommitWearables(hero, *snapshot, heroId);
         const auto elapsed = GetTickCount64() - begin;
         RememberCommitted(staged.paths);
+        ReleaseModels(committedModels);
+        committedModels = std::move(staged.models);
         ReleaseStaged(); scheduler.Complete(); verifyAt = now + VerifyDelayMs; checkAt = 0;
         std::lock_guard<std::mutex> lock(statusMutex);
         ++status.rebuilds; status.commitMs = uint32_t(elapsed);
@@ -487,32 +562,57 @@ void __fastcall OnThink(void* hero) {
         status.matched = rebuilt ? status.expected : 0;
         status.views = rebuilt ? uint32_t(reinterpret_cast<NativeVector*>(uintptr_t(hero) + profile::CreationList)->count) : 0;
     } else if (staged.list.data && now - staged.started > 10000) {
-        ReleaseStaged(); scheduler.Complete(); SetPhase(Phase::MissingItems);
+        ReleaseStaged(); scheduler.Complete(); checkAt = now + CheckIntervalMs; SetPhase(Phase::MissingItems);
     }
-    originalThink(hero);
     if (verifyAt && now >= verifyAt) {
         char name[264]; verifyAt = 0; checkAt = now + CheckIntervalMs; RecordRenderModel(hero, name);
-    } else if (checkAt && now >= checkAt && !staged.list.data && scheduler.CompleteState()) {
+    } else if (checkAt && now >= checkAt && !staged.list.data && (scheduler.CompleteState() || scheduler.Exhausted())) {
         char name[264]; checkAt = now + CheckIntervalMs; RecordRenderModel(hero, name);
-        if (!RenderMatchesCommitted(name) && scheduler.Retry(now)) {
-            std::lock_guard<std::mutex> lock(statusMutex); ++status.resyncs; status.phase = Phase::Pending;
-        }
+        const bool wearablesMissing = *reinterpret_cast<int32_t*>(uintptr_t(hero) + profile::WearableCount) <= 0;
+        const bool failed = NativeStatus().phase == Phase::MissingItems || scheduler.Exhausted();
+        const bool mismatch = *name && !TemporaryForm(name) &&
+            (failed || !RenderMatchesCommitted(name) || wearablesMissing);
+        if (mismatch && scheduler.Retry(now)) {
+            std::lock_guard<std::mutex> lock(statusMutex); ++status.resyncs; status.phase = Phase::Pending; status.matched = 0;
+        } else if (!failed && RenderMatchesCommitted(name) && !TemporaryForm(name) && !wearablesMissing) scheduler.Healthy(now);
+        else scheduler.Unhealthy();
     }
     if (!staged.list.data && scheduler.Exhausted()) SetPhase(Phase::MissingItems);
     // Readable diagnostics stay off the model-loading path; the HUD only
     // reports native input acceptance, not proof of completed visual loading.
     { std::lock_guard<std::mutex> lock(statusMutex); status.lastSeenMs = now; }
 }
+profile::Resolution ResolveProfile() {
+    __try { return profile::Resolver().Run(base); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        profile::Resolution failed;
+        strcpy_s(failed.failure, "image: unreadable while resolving");
+        return failed;
+    }
+}
 }
 
 void InitializeNative() {
     const auto module = GetModuleHandleW(L"client.dll"); base = uintptr_t(module);
-    if (!base || !DiskMatches(module) || !MemoryMatches()) { SetPhase(Phase::Unsupported); return; }
+    if (!base) { SetPhase(Phase::Unsupported); return; }
+    // Relocate the profile before anything reads an address from it. A Dota
+    // update usually only moves this code, which the resolver follows on its
+    // own; the disk hash only records whether this is the build we verified.
+    const auto resolution = ResolveProfile();
+    // Hashing a hundred megabytes is far too slow to do while holding the lock
+    // the render thread reads the status under, and it only labels the result.
+    const bool exact = resolution.exact && DiskMatches(module);
+    { std::lock_guard<std::mutex> lock(statusMutex);
+      status.profileExact = exact;
+      status.profileMoved = resolution.moved;
+      strcpy_s(status.profileDetail, resolution.resolved
+          ? (exact ? "build vérifiée" : "relocalisé pour une build mise à jour") : resolution.failure); }
+    if (!resolution.resolved) { SetPhase(Phase::Unsupported); return; }
     findItem = reinterpret_cast<FindItemFn>(base + profile::FindItemView);
     defaultView = reinterpret_cast<DefaultFn>(base + profile::DefaultView);
     wearablePlayer = reinterpret_cast<WearablePlayerFn>(base + profile::WearablePlayer);
 #define NATIVE_MEMBER(member, offset) engine.member = reinterpret_cast<decltype(engine.member)>(base + profile::offset)
-    NATIVE_MEMBER(allocate, Allocate); NATIVE_MEMBER(free, Free);
+    engine.allocate = &EngineAllocate; engine.free = &EngineFree;
     NATIVE_MEMBER(kvCtor, KeyValuesCtor); NATIVE_MEMBER(kvDtor, KeyValuesDtor);
     NATIVE_MEMBER(prepare, PrepareWearables); NATIVE_MEMBER(create, CreateWearables); NATIVE_MEMBER(destroy, DestroyWearables);
     NATIVE_MEMBER(modifierCtor, ModifierCtor); NATIVE_MEMBER(modifierManager, ModifierManager); NATIVE_MEMBER(populate, PopulateModifiers);
@@ -577,11 +677,11 @@ void TickNativeDiagnostics() {
 const char* PhaseText(Phase phase) {
     switch (phase) {
     case Phase::Starting: return "Vérification de Dota...";
-    case Phase::Unsupported: return "Version de Dota non reconnue : apparence en partie désactivée";
+    case Phase::Unsupported: return "client.dll non reconnu : apparence en partie désactivée (voir le profil ci-dessous)";
     case Phase::Ready: return "Prêt - équipe une tenue dans Dota, puis choisis ton héros";
     case Phase::Pending: return "Chargement de la tenue du héros...";
     case Phase::Prepared: return "Tenue transmise au moteur de Dota";
-    case Phase::MissingItems: return "Tenue indisponible dans le moteur - nouvelle tentative au prochain équipement";
+    case Phase::MissingItems: return "Tenue indisponible - récupération automatique avec délai entre les tentatives";
     default: return "Connexion au moteur indisponible";
     }
 }

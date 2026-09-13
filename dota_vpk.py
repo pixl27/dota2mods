@@ -12,7 +12,6 @@ and `Archive(game).read("scripts/items/items_game.txt")` returns bytes.
 import os
 import re
 import struct
-import subprocess
 import sys
 from pathlib import Path
 
@@ -20,18 +19,48 @@ GAME_RELATIVE = Path("steamapps") / "common" / "dota 2 beta" / "game" / "dota"
 
 
 def _from_running_dota():
-    try:
-        output = subprocess.run(["wmic", "process", "where", "name='dota2.exe'", "get", "ExecutablePath"],
-                                capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
+    """Dota's directory taken from the running game, without shelling out.
+
+    The obvious way to find a running process is wmic, but it is deprecated,
+    absent from recent Windows 11 builds, and slow enough to stall a caller for
+    seconds. The tool help snapshot API answers the same question immediately.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+    if snapshot == -1:
         return None
-    for line in output.splitlines():
-        line = line.strip()
-        if line.lower().endswith("dota2.exe"):
-            # <root>\game\bin\win64\dota2.exe -> <root>\game\dota
-            candidate = Path(line).parent.parent.parent / "dota"
-            if (candidate / "pak01_dir.vpk").exists():
-                return candidate
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(Entry)
+        found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.szExeFile.lower() == "dota2.exe":
+                handle = kernel32.OpenProcess(0x1000, False, entry.th32ProcessID)
+                if handle:
+                    try:
+                        path = ctypes.create_unicode_buffer(1024)
+                        size = wintypes.DWORD(1024)
+                        if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
+                            # <root>/game/bin/win64/dota2.exe -> <root>/game/dota
+                            candidate = Path(path.value).parent.parent.parent / "dota"
+                            if (candidate / "pak01_dir.vpk").exists():
+                                return candidate
+                    finally:
+                        kernel32.CloseHandle(handle)
+                return None
+            found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
     return None
 
 

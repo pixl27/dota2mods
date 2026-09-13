@@ -51,14 +51,14 @@ exit /b 1
 if not exist build mkdir build
 if not exist data mkdir data
 REM Object files go under build\obj; the exe and dll compile ImGui with different flags.
-for %%D in (exe dll map) do if not exist build\obj\%%D mkdir build\obj\%%D
+for %%D in (app dll map) do if not exist build\obj\%%D mkdir build\obj\%%D
 
 set IMGUI=thirdparty\imgui\imgui.cpp thirdparty\imgui\imgui_draw.cpp thirdparty\imgui\imgui_tables.cpp thirdparty\imgui\imgui_widgets.cpp thirdparty\imgui\backends\imgui_impl_win32.cpp thirdparty\imgui\backends\imgui_impl_dx11.cpp
 set INCLUDES=/Ithirdparty /Ithirdparty\imgui /Ithirdparty\imgui\backends /Ithirdparty\minhook\include /Isrc
 set LIBS=d3d11.lib dxgi.lib dwmapi.lib ws2_32.lib psapi.lib
 
-echo [*] Building wardrobe.exe (external preview overlay)...
-cl /nologo /O2 /EHsc /std:c++17 /utf-8 /Fobuild\obj\exe\ /DUNICODE /D_UNICODE %INCLUDES% src\main.cpp src\browser.cpp %IMGUI% /link %LIBS% /OUT:build\wardrobe.exe user32.lib gdi32.lib
+echo [*] Building Wardrobe.exe (the application)...
+cl /nologo /O2 /EHsc /std:c++17 /utf-8 /Fobuild\obj\app\ /DUNICODE /D_UNICODE /Ithirdparty /Ithirdparty\imgui /Ithirdparty\imgui\backends /Isrc src\app\app.cpp %IMGUI% /link /SUBSYSTEM:WINDOWS /OUT:build\Wardrobe.exe d3d11.lib dxgi.lib dwmapi.lib shell32.lib advapi32.lib user32.lib gdi32.lib
 if errorlevel 1 goto :exe_fail
 
 echo [*] Building wardrobe_dll.dll (live-swap payload, manual-map only)...
@@ -71,7 +71,7 @@ if errorlevel 1 goto :map_fail
 goto :build_ok
 
 :exe_fail
-echo [!] EXE build failed
+echo [!] Application build failed
 if not defined WARDROBE_NO_PAUSE pause
 exit /b 1
 
@@ -91,17 +91,18 @@ echo.
 echo [*] Copying cfg + data helpers...
 if not exist build\data mkdir build\data
 if exist data\skins_full.json copy /Y data\skins_full.json build\data\ >nul
-for %%F in (cfg\gamestate_integration_wardrobe.cfg gen_full_db.py gen_names.py update_db.py dota_vpk.py repair_inventory_cache.py verify_profile.py launch_level3.bat) do (
+if exist data\native_profile.json copy /Y data\native_profile.json build\data\ >nul
+for %%F in (cfg\gamestate_integration_wardrobe.cfg gen_full_db.py gen_names.py update_db.py dota_vpk.py repair_inventory_cache.py verify_profile.py refresh_profile.py launch_level3.bat) do (
     if exist "%%F" (copy /Y "%%F" build\ >nul) else echo [!] missing %%F
 )
 
 echo.
 echo [OK] Done. Folder build\ now holds:
-echo      wardrobe.exe      - the overlay. Run this. No admin, no injection.
-echo      wardrobe_dll.dll  - live-swap payload. map.exe ONLY, never double-click.
-echo      map.exe           - manual-map loader. Usage: map.exe wardrobe_dll.dll
+echo      Wardrobe.exe      - the application. Run this; everything is in it.
+echo      wardrobe_dll.dll  - in-game payload, loaded by the application.
+echo      map.exe           - the loader the application calls.
 echo      launch_level3.bat - GC receiver with automatic inventory refresh.
-echo      verify_profile.py - checks that Dota's client.dll still matches the appearance profile.
+echo      refresh_profile.py - re-locates the appearance profile in a new client.dll after a Dota update.
 echo      update_db.py      - rebuilds data\skins_full.json straight from Dota's VPK after an update.
 echo      repair_inventory_cache.py - inspect/restore Dota's saved inventory cache.
 echo      gamestate_integration_wardrobe.cfg - copy into Dota cfg folder (see README).

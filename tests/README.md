@@ -1,7 +1,7 @@
 # GC receiver regression checks
 
 Run `tests\run_tests.bat` from Windows with Visual Studio C++ Build Tools installed.
-The script finds the x64 compiler and builds four standalone test executables.
+The script finds the x64 compiler and builds five standalone test executables.
 It also uses Python for the cache-repair tests.
 
 `gc_protocol_test.cpp` checks hand-written Dota wire fixtures, nested welcome
@@ -37,8 +37,24 @@ Passing these checks does not prove that a live Dota build accepts the modified
 cache or that items can be equipped. Runtime verification still requires the
 in-game receiver status and inspection of the local inventory.
 
+`native_appearance_test.cpp` covers repeated transformation/return cycles,
+preserving unfamiliar temporary forms, reconnects with reused and new entity
+handles, ownership loss during loading, manifest re-registration, retaining
+transformation resources, failed model loads and recovery without re-equipping.
+The same production path runs with several hero IDs. Recovery is bounded per
+failure burst, with a cooldown and a budget reset after sustained healthy render.
+These engine fixtures do not verify the appearance in a live match.
+
 Receiver v5 additionally tests service-0/service-1 isolation (including an empty
 econ cache), saved-preview detection, account isolation, retry/resume without
 another full catalog reload, and duplicate-instance rejection. The Python
 repair tests use temporary fixtures under `build`, verify backup integrity and
 preservation of clean caches, and reject repair while Dota is running.
+
+`resolver_against_client.cpp` maps the installed `client.dll` the way Windows
+would and runs the DLL's own profile resolver over it, twice: once as recorded,
+and once with every recorded address blanked so each function and value has to be
+found by its signature, its call site or its schema declaration. Both runs must
+reproduce the recorded profile exactly. It reports SKIP instead of failing when
+Dota 2 is not installed on the machine, and accepts a path to any client.dll so a
+future build can be checked before shipping a profile for it.

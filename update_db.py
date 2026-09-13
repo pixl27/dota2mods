@@ -55,14 +55,18 @@ def main(argv=None):
         [python, str(HERE / "gen_full_db.py"), "--items-game", str(data / "items_game.txt")] + (["--all-global"] if args.all_global else []),
         [python, str(HERE / "gen_names.py"), "--localization", str(data / "items_english.txt"), str(data / "dota_english.txt")],
     ]
-    for step in steps:
-        result = subprocess.run(step)
-        if result.returncode:
-            print(f"[!] {Path(step[1]).name} failed with exit code {result.returncode}")
-            return result.returncode
-    if not args.keep_inputs:
-        for path in extracted:
-            path.unlink(missing_ok=True)
+    try:
+        for step in steps:
+            result = subprocess.run(step)
+            if result.returncode:
+                print(f"[!] {Path(step[1]).name} failed with exit code {result.returncode}")
+                return result.returncode
+    finally:
+        # These are 60 MB of game files extracted only to feed the generators.
+        # Leaving them behind after a failure is how a data folder silently grows.
+        if not args.keep_inputs:
+            for path in extracted:
+                path.unlink(missing_ok=True)
     verify = HERE / "verify_profile.py"
     if verify.exists():
         subprocess.run([python, str(verify), str(game / "bin" / "win64" / "client.dll")])

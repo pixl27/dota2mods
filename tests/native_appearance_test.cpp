@@ -1,8 +1,10 @@
 #include "../src/native_appearance.cpp"
+#include <algorithm>
 #include <iostream>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 MH_STATUS WINAPI MH_CreateHook(LPVOID, LPVOID, LPVOID*) { return MH_OK; }
 MH_STATUS WINAPI MH_EnableHook(LPVOID) { return MH_OK; }
@@ -24,7 +26,8 @@ static void __fastcall BuildList(void* hero, void* kv, void* resources, appearan
     appearance::OnSpawnList(hero, kv, resources, output);
     if (!output->count) {
         auto inventory = appearance::OnPlayerInventory(nullptr,0,false);
-        createdSelection = static_cast<appearance::RenderSlot*>(appearance::OnEquipped(inventory,49,0,false));
+        const auto heroId = *reinterpret_cast<uint32_t*>(uintptr_t(hero) + appearance::profile::HeroId);
+        createdSelection = static_cast<appearance::RenderSlot*>(appearance::OnEquipped(inventory,heroId,0,false));
         output->count = createdSelection ? 2 : 0;
     }
 }
@@ -32,7 +35,7 @@ static void* __fastcall PlayerInventory(void*, int32_t, bool) { return nullptr; 
 static void* __fastcall EquippedView(void*, uint32_t, uint32_t, bool) { return nullptr; }
 static void* __fastcall FindItem(void* inventory, uint64_t id, int32_t*) {
     lookupId = id;
-    if (missing || uintptr_t(inventory) != appearance::base + appearance::profile::LocalInventory || id != wanted.item) return nullptr;
+    if (missing || uintptr_t(inventory) != appearance::LocalInventory() || id != wanted.item) return nullptr;
     return &wanted;
 }
 static void* __fastcall DefaultView(void*, uint32_t, uint32_t) { static appearance::RenderSlot result{0,10,0}; return &result; }
@@ -87,6 +90,7 @@ static void __fastcall ModelName(void*, void* handle, char* output, uint32_t siz
         handle == errorResource.data() ? "models/dev/error.vmdl" : handle == dragonResource.data() ? "dragon.vmdl" : "default.vmdl");
 }
 static bool ready = true;
+static bool failModelLoad = false;
 static void* combinedBase = nullptr;
 static std::set<std::string> registeredModels;
 static unsigned nameCtors = 0, namePurges = 0, manifestAdds = 0, handleFinds = 0;
@@ -102,7 +106,7 @@ static appearance::PointerList replacements{1, 0, replacementEntries};
 static void* __fastcall EntityModels(void* modifiers) { Check(modifiers != nullptr, "Replacements are read from the staged modifier list"); return &replacements; }
 // Like Dota, an unregistered model resolves to an empty handle bound to models/dev/error.vmdl.
 static void* __fastcall LoadModel(void*, void** output, const char* path) {
-    *output = registeredModels.count(path) ? ResourceFor(path) : errorResource.data();
+    *output = !failModelLoad && registeredModels.count(path) ? ResourceFor(path) : errorResource.data();
     return output;
 }
 static const char* NamePath(void* name) { return static_cast<appearance::ResourceName*>(name)->storage; }
@@ -113,7 +117,7 @@ static void __fastcall NameCtor(void* raw, const char* path) {
 }
 static bool __fastcall NameIsType(void* name, uint32_t type) {
     const auto path = NamePath(name); const auto length = strlen(path);
-    return type == appearance::ModelResourceType && length > 5 && !strcmp(path + length - 5, ".vmdl");
+    return type == appearance::profile::ModelResourceType && length > 5 && !strcmp(path + length - 5, ".vmdl");
 }
 static void __fastcall NamePurge(void*, int32_t) { ++namePurges; }
 static int32_t __fastcall ResourceState(void*, appearance::ResourceName* name) { return registeredModels.count(NamePath(name)) ? 3 : 0; }
@@ -159,24 +163,113 @@ int main() {
         InitializeNative();
         Check(NativeStatus().phase == Phase::Unsupported, "No client module must leave native writes disabled");
         Check(!DiskMatches(GetModuleHandleW(nullptr)), "An unrelated executable cannot match the Dota profile");
+
+        // A synthetic client.dll: every recorded signature and site window placed
+        // where the profile expects it, so the resolver must reproduce the profile.
+        std::vector<uintptr_t> recordedFunctions, recordedValues;
+        for (const auto& signature : profile::Functions) recordedFunctions.push_back(*signature.target);
+        for (const auto& site : profile::Sites) recordedValues.push_back(*site.target);
         base = uintptr_t(VirtualAlloc(nullptr, profile::ImageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        Check(base && !MemoryMatches(), "Malformed image headers are rejected before any hooks");
+        Check(base && !profile::Resolver().Run(base).resolved, "Malformed image headers are rejected before any hooks");
         auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base); dos->e_magic = IMAGE_DOS_SIGNATURE; dos->e_lfanew = 128;
         auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + 128); nt->Signature = IMAGE_NT_SIGNATURE;
         nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64; nt->FileHeader.TimeDateStamp = profile::Timestamp;
+        nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+        nt->FileHeader.NumberOfSections = 2;
+        nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
         nt->OptionalHeader.SizeOfImage = profile::ImageSize;
-        memcpy(reinterpret_cast<void*>(base + profile::Think), profile::ThinkBytes, sizeof(profile::ThinkBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::GatherNetwork), profile::NetworkBytes, sizeof(profile::NetworkBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::GatherInventory), profile::InventoryBytes, sizeof(profile::InventoryBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::InventoryForPlayer), profile::PlayerInventoryBytes, sizeof(profile::PlayerInventoryBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::EquippedView), profile::EquippedBytes, sizeof(profile::EquippedBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::BuildWearableList), profile::BuildListBytes, sizeof(profile::BuildListBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::BuildSpawnWearableList), profile::SpawnListBytes, sizeof(profile::SpawnListBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::PrepareWearables), profile::PrepareBytes, sizeof(profile::PrepareBytes));
-        memcpy(reinterpret_cast<void*>(base + profile::CreateWearables), profile::CreateBytes, sizeof(profile::CreateBytes));
-        Check(MemoryMatches(), "The verified profile accepts the corresponding runtime entry bytes");
-        *reinterpret_cast<uint8_t*>(base + profile::GatherInventory) ^= 1;
-        Check(!MemoryMatches(), "A changed function entry disables the profile even when the PE version matches");
+        constexpr uint32_t TextRva = 0x1000, DataRva = 0x3b80000;
+        auto section = IMAGE_FIRST_SECTION(nt);
+        memcpy(section[0].Name, ".text", 6);
+        section[0].VirtualAddress = TextRva; section[0].Misc.VirtualSize = DataRva - TextRva;
+        section[0].Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+        memcpy(section[1].Name, ".rdata", 7);
+        section[1].VirtualAddress = DataRva; section[1].Misc.VirtualSize = profile::ImageSize - DataRva;
+        section[1].Characteristics = IMAGE_SCN_MEM_READ;
+        auto place = [&](uintptr_t rva, const uint8_t* bytes, size_t size) { memcpy(reinterpret_cast<void*>(base + rva), bytes, size); };
+        for (const auto& signature : profile::Functions) place(*signature.target, signature.bytes, signature.size);
+        for (const auto& site : profile::Sites)
+            place(site.kind == profile::SiteKind::Schema ? site.offset : *site.function + site.offset, site.bytes, site.size);
+        for (const auto& site : profile::Sites)
+            if (site.text) strcpy_s(reinterpret_cast<char*>(base + *site.target), 64, site.text);
+
+        auto resolution = profile::Resolver().Run(base);
+        Check(resolution.resolved && !resolution.searched && !resolution.moved,
+            "A client.dll laid out as recorded resolves without searching for anything");
+        for (size_t i = 0; i < std::size(profile::Functions); ++i)
+            Check(*profile::Functions[i].target == recordedFunctions[i], "Every function resolves to its recorded address");
+        for (size_t i = 0; i < std::size(profile::Sites); ++i)
+            Check(*profile::Sites[i].target == recordedValues[i], "Every global, struct offset and vtable slot re-reads to its recorded value");
+
+        // An update that only moves code: the signature is found at its new address.
+        const uintptr_t recordedThink = profile::Think, movedThink = 0x2000000;
+        auto moveThink = [&](uintptr_t to) {
+            memset(reinterpret_cast<void*>(base + profile::Think), 0, sizeof(profile::ThinkBytes));
+            if (to) place(to, profile::ThinkBytes, sizeof(profile::ThinkBytes));
+        };
+        moveThink(movedThink);
+        resolution = profile::Resolver().Run(base);
+        Check(resolution.resolved && profile::Think == movedThink && resolution.moved == 1 && resolution.searched == 1,
+            "A function that moved is found again by its signature, and only it is reported as moved");
+        moveThink(0);
+        profile::Think = recordedThink;
+        place(profile::Think, profile::ThinkBytes, sizeof(profile::ThinkBytes));
+
+        // A signature that is present twice cannot be trusted to be the right one.
+        moveThink(movedThink);
+        place(movedThink + 0x1000, profile::ThinkBytes, sizeof(profile::ThinkBytes));
+        profile::Think = recordedThink;
+        resolution = profile::Resolver().Run(base);
+        Check(!resolution.resolved && strstr(resolution.failure, "Think") && strstr(resolution.failure, "ambiguous"),
+            "An ambiguous signature names itself and disables the integration instead of guessing");
+        memset(reinterpret_cast<void*>(base + movedThink), 0, sizeof(profile::ThinkBytes));
+        memset(reinterpret_cast<void*>(base + movedThink + 0x1000), 0, sizeof(profile::ThinkBytes));
+        place(profile::Think, profile::ThinkBytes, sizeof(profile::ThinkBytes));
+
+        // A schema field is re-read from the declaration next to its name.
+        const auto& steamId = *std::find_if(std::begin(profile::Sites), std::end(profile::Sites),
+            [](const profile::Site& s) { return s.kind == profile::SiteKind::Schema && !strcmp(s.name, "SteamId"); });
+        constexpr uintptr_t NameRva = 0x3c00000, DeclarationRva = 0x2100000;
+        memset(reinterpret_cast<void*>(base + steamId.offset), 0, steamId.size);
+        strcpy_s(reinterpret_cast<char*>(base + NameRva), 32, steamId.text);
+        place(DeclarationRva, steamId.bytes, steamId.size);
+        const uintptr_t reference = DeclarationRva + steamId.size + 1;   // 48 8d 15 <rel32>
+        auto declaration = reinterpret_cast<uint8_t*>(base + DeclarationRva + steamId.size);
+        declaration[0] = 0x48; declaration[1] = 0x8d; declaration[2] = 0x15;
+        const int32_t relative = int32_t(NameRva - (reference + 6));
+        memcpy(declaration + 3, &relative, sizeof(relative));
+        profile::SteamId = 0;
+        resolution = profile::Resolver().Run(base);
+        Check(resolution.resolved && profile::SteamId == recordedValues[std::distance(std::begin(profile::Sites), &steamId)],
+            "A schema field offset is recovered from the declaration beside its name when the code moved");
+        memset(reinterpret_cast<void*>(base + DeclarationRva), 0, steamId.size + 7);
+        place(steamId.offset, steamId.bytes, steamId.size);
+
+        // A site whose window is gone fails by name rather than resolving to rubbish.
+        const auto& creation = *std::find_if(std::begin(profile::Sites), std::end(profile::Sites),
+            [](const profile::Site& s) { return !strcmp(s.name, "CreationList"); });
+        memset(reinterpret_cast<void*>(base + *creation.function + creation.offset), 0, creation.size);
+        resolution = profile::Resolver().Run(base);
+        Check(!resolution.resolved && strstr(resolution.failure, "CreationList"),
+            "A site the update removed names itself instead of yielding a wrong offset");
+        place(*creation.function + creation.offset, creation.bytes, creation.size);
+        Check(profile::Resolver().Run(base).resolved, "Restoring the window resolves the profile again");
+
+        // A call that merely repeats a unique signature may confirm it, never replace it.
+        const auto& call = *std::find_if(std::begin(profile::Sites), std::end(profile::Sites),
+            [](const profile::Site& s) { return s.kind == profile::SiteKind::Call && s.verify; });
+        const uintptr_t callWindow = *call.function + call.offset;
+        const uintptr_t honest = *call.target;
+        int32_t original = 0;
+        memcpy(&original, reinterpret_cast<void*>(base + callWindow + call.operand), sizeof(original));
+        const int32_t elsewhere = int32_t(0x2500000 - (callWindow + call.end));
+        memcpy(reinterpret_cast<void*>(base + callWindow + call.operand), &elsewhere, sizeof(elsewhere));
+        resolution = profile::Resolver().Run(base);
+        Check(!resolution.resolved && strstr(resolution.failure, "disagrees") && *call.target == honest,
+            "A call site that points somewhere else than the signature fails instead of overwriting it");
+        memcpy(reinterpret_cast<void*>(base + callWindow + call.operand), &original, sizeof(original));
+        Check(profile::Resolver().Run(base).resolved && *call.target == honest,
+            "The signature keeps the address once the call agrees with it again");
 
         std::array<uint8_t, 0x2000> hero{}, otherHero{};
         std::array<uint8_t, 0x1000> controller{};
@@ -240,8 +333,8 @@ int main() {
         Check(registeredModels.count("persona.vmdl") && registeredModels.count("wearable.vmdl") && registeredModels.count("dragon.vmdl") &&
             manifestAdds == 3 && NativeStatus().registered == 3 && !NativeStatus().unavailable,
             "The persona skeleton, its wearables and its transformation models are registered before loading");
-        Check(*reinterpret_cast<LONG*>(dragonResource.data() + 0x20) == 0 && staged.paths.empty(),
-            "Preloaded transformation models are released with the rest of the stage");
+        Check(*reinterpret_cast<LONG*>(dragonResource.data() + 0x20) == 1 && staged.paths.empty(),
+            "Transformation resources stay referenced while the outfit is equipped");
         Check(nameCtors == 3 && namePurges == 3, "Every resource name built for registration is purged");
         verifyAt = 1; OnThink(hero.data());
         Check(!verifyAt && checkAt && !strcmp(NativeStatus().renderModel, "persona.vmdl"), "After a commit the entity's rendered model is read back for diagnostics");
@@ -286,7 +379,7 @@ int main() {
         ready = true; Settle(hero.data());
         Check(modelName == "default.vmdl" && createdCalls == 4, "The latest selection wins when resource loading finishes");
         verifyAt = 1; OnThink(hero.data());
-        currentModel = personaResource.data(); checkAt = 1; OnThink(hero.data());
+        currentModel = errorResource.data(); checkAt = 1; OnThink(hero.data());
         Check(NativeStatus().resyncs == 1 && NativeStatus().phase == Phase::Pending && createdCalls == 4,
             "A server-driven model change away from the committed outfit schedules one re-application");
         Settle(hero.data());
@@ -296,15 +389,120 @@ int main() {
             verifyAt = 1; OnThink(hero.data()); currentModel = errorResource.data(); checkAt = 1; OnThink(hero.data());
             Settle(hero.data());
         }
-        Check(NativeStatus().resyncs == Scheduler::MaxResyncs && createdCalls == 7, "A persistent mismatch is bounded per outfit and cannot loop");
+        Check(NativeStatus().resyncs == Scheduler::MaxResyncs && createdCalls == 7, "A persistent mismatch has a bounded recovery burst");
         Scheduler resync; resync.Observe(1, 1, 0);
         Check(!resync.Retry(0), "No resync before the outfit was committed");
         resync.Complete();
         Check(resync.Retry(10) && !resync.Begin(50) && resync.Begin(85) && resync.Resyncs() == 1, "A resync waits like a fresh equip before rebuilding");
         resync.Complete(); resync.Retry(200); resync.Complete(); resync.Retry(300); resync.Complete();
-        Check(!resync.Retry(400) && resync.Observe(1, 2, 500) && !resync.Resyncs(), "A new outfit restores the resync budget");
-        Check(*reinterpret_cast<LONG*>(wearableResource.data()+0x20) == 0 && *reinterpret_cast<LONG*>(personaResource.data()+0x20) == 0,
-            "Completed and cancelled stages release their model resource references");
+        Check(!resync.Retry(400) && resync.Retry(300 + Scheduler::RecoveryCooldownMs),
+            "Persistent failures cool down and can recover later without another equip");
+        resync.Complete(); resync.Healthy(40000); resync.Healthy(40000 + Scheduler::HealthyMs);
+        Check(!resync.Resyncs() && resync.Retry(44000), "A confirmed healthy outfit restores the recovery budget");
+        Check(resync.Observe(1, 2, 50000) && !resync.Resyncs(), "A new outfit restores the resync budget");
+
+        // Repeated abilities must not spend retries on their temporary models,
+        // and each later return to human must still restore the persona.
+        next = std::make_shared<Snapshot>(*next); ++next->revision;
+        next->selections[0] = {49,0,wanted.item,wanted.definition,wanted.style}; Publish(next);
+        currentModel = defaultResource.data(); OnThink(hero.data()); Settle(hero.data());
+        for (unsigned cycle = 0; cycle < 8; ++cycle) {
+            scheduler.Healthy(1); scheduler.Healthy(1 + Scheduler::HealthyMs);
+            const auto before = createdCalls;
+            currentModel = dragonResource.data(); verifyAt = 0; checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+            Check(createdCalls == before && currentModel == dragonResource.data(), "A dragon stays a dragon without human reconstruction");
+            currentModel = wearableResource.data(); checkAt = 1; OnThink(hero.data());
+            Check(createdCalls == before, "An unfamiliar temporary form is not overwritten");
+            currentModel = defaultResource.data(); checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+            Check(createdCalls == before + 1 && currentModel == personaResource.data(),
+                "Every return to human restores the persona, including beyond three transformations");
+        }
+        Check(!ModelMatches("default_dragon.vmdl", "default.vmdl") && ModelMatches("default_c_12.vmdl", "default.vmdl"),
+            "A shared path prefix is not proof that the base model matches");
+
+        // Reconnect with exactly the same pointer and handle, after the manifest
+        // and server equipment were replaced. No new selection is published.
+        auto beforeReconnect = createdCalls;
+        registeredModels.clear(); currentModel = errorResource.data();
+        lastLocalThink = GetTickCount64() - SessionGapMs - 1;
+        OnThink(hero.data()); Settle(hero.data());
+        Check(createdCalls == beforeReconnect + 1 && currentModel == personaResource.data() && registeredModels.count("dragon.vmdl"),
+            "Reconnect with a reused entity re-registers resources and restores the unchanged outfit");
+        beforeReconnect = createdCalls;
+        NativeVector respawn{}; OnBuildList(hero.data(), reinterpret_cast<void*>(1), nullptr, &respawn);
+        currentModel = errorResource.data(); OnThink(hero.data()); Settle(hero.data());
+        Check(createdCalls == beforeReconnect + 1 && currentModel == personaResource.data(),
+            "A native respawn invalidates completed work even without a long think gap");
+
+        ready = false;
+        next = std::make_shared<Snapshot>(*next); ++next->revision; ++next->selections[0].style; ++wanted.style; Publish(next);
+        OnThink(hero.data()); Settle(hero.data());
+        Check(staged.list.data != nullptr, "Reconnect fixture has an unfinished stage");
+        OnThink(otherHero.data());
+        Check(staged.list.data != nullptr, "An unrelated hero think cannot cancel the local stage");
+        *reinterpret_cast<uint32_t*>(controller.data() + profile::AssignedHero) = 0xffffffff;
+        OnThink(hero.data());
+        Check(!staged.list.data, "Losing local ownership discards the unfinished stage");
+        *reinterpret_cast<uint32_t*>(controller.data() + profile::AssignedHero) = 0x8005;
+        ready = true; OnThink(hero.data()); Settle(hero.data());
+        Check(rendered.style == wanted.style, "Reacquiring the same hero applies the latest selection");
+
+        beforeReconnect = createdCalls;
+        ready = false;
+        next = std::make_shared<Snapshot>(*next); ++next->revision; ++next->selections[0].style; ++wanted.style; Publish(next);
+        OnThink(hero.data()); Settle(hero.data());
+        currentModel = dragonResource.data(); ready = true; OnThink(hero.data()); Settle(hero.data());
+        Check(!staged.list.data && createdCalls == beforeReconnect && currentModel == dragonResource.data(),
+            "A form change during loading cancels the stale stage without forcing a human model");
+        currentModel = defaultResource.data(); Sleep(260); Settle(hero.data());
+        Check(createdCalls == beforeReconnect + 1 && rendered.style == wanted.style,
+            "An equip deferred during transformation completes after returning to human");
+
+        beforeReconnect = createdCalls;
+        failModelLoad = true;
+        next = std::make_shared<Snapshot>(*next); ++next->revision; ++next->selections[0].style; ++wanted.style; Publish(next);
+        OnThink(hero.data()); Settle(hero.data());
+        Check(staged.list.data && createdCalls == beforeReconnect && currentModel == personaResource.data(),
+            "An error resource reported ready never replaces the visible outfit");
+        staged.started = GetTickCount64() - 10001; OnThink(hero.data());
+        Check(!staged.list.data && NativeStatus().phase == Phase::MissingItems,
+            "A failed resource stage expires without destroying the previous outfit");
+        failModelLoad = false; checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+        Check(createdCalls == beforeReconnect + 1 && rendered.style == wanted.style,
+            "Transient resource failure recovers without another equip request");
+        beforeReconnect = createdCalls;
+        *reinterpret_cast<int32_t*>(hero.data() + profile::WearableCount) = 0;
+        verifyAt = 0; checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+        Check(createdCalls == beforeReconnect + 1 && currentModel == personaResource.data(),
+            "Missing wearables recover even when the hero model still matches");
+
+        // Exercise the production path with several identities, without a DK
+        // branch in either the lookup fixture or the appearance implementation.
+        for (uint32_t heroId : {1u, 55u, 74u, 126u}) {
+            *reinterpret_cast<uint32_t*>(hero.data() + profile::HeroId) = heroId;
+            auto& assigned = *reinterpret_cast<uint32_t*>(controller.data() + profile::AssignedHero);
+            assigned += 0x8000;
+            *reinterpret_cast<uint32_t*>(identities.data() + 5 * 0x70 + 0x10) = assigned;
+            currentModel = defaultResource.data();
+            CaptureSpawnModel(hero.data(), reinterpret_cast<void*>(1));
+            next = std::make_shared<Snapshot>(*next); ++next->revision; next->selections[0].hero = heroId; Publish(next);
+            OnThink(hero.data()); Settle(hero.data());
+            const auto before = createdCalls;
+            currentModel = defaultResource.data(); verifyAt = 0; checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+            Check(createdCalls == before + 1 && currentModel == personaResource.data() && NativeStatus().hero == heroId,
+                "The same appearance recovery applies to each local hero identity");
+            assigned += 0x8000;
+            *reinterpret_cast<uint32_t*>(identities.data() + 5 * 0x70 + 0x10) = assigned;
+            currentModel = errorResource.data();
+            OnThink(hero.data()); Settle(hero.data());
+            Check(currentModel == personaResource.data() && !strcmp(baselineModel.data(), "default.vmdl"),
+                "A new entity with an error model reuses that hero's original baseline");
+        }
+
+        ReleaseModels(committedModels);
+        Check(*reinterpret_cast<LONG*>(wearableResource.data()+0x20) == 0 && *reinterpret_cast<LONG*>(personaResource.data()+0x20) == 0 &&
+            *reinterpret_cast<LONG*>(dragonResource.data()+0x20) == 0,
+            "Replacing, cancelling and releasing outfits balances all resource references");
         ReleaseCreationList(*reinterpret_cast<NativeVector*>(hero.data() + profile::CreationList));
         ReleaseModifiers(*reinterpret_cast<void**>(hero.data() + profile::Modifiers));
         VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE); base = 0;

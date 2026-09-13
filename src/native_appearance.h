@@ -9,6 +9,9 @@ struct Status {
     uint64_t revision = 0, rebuilds = 0, gathers = 0, lastSeenMs = 0, wearableLists = 0;
     uint32_t prepareMs = 0, commitMs = 0;
     uint32_t registered = 0, known = 0, unavailable = 0, resyncs = 0;
+    uint32_t profileMoved = 0;
+    bool profileExact = false;
+    char profileDetail[96]{};
     char baseModel[264]{}, selectedModel[264]{}, renderModel[264]{};
 };
 void InitializeNative();
