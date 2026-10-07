@@ -1,0 +1,127 @@
+"""Draws Wardrobe's icon: a coat hanger on a violet-to-azure squircle.
+
+usage: python assets/make_icon.py
+
+Writes assets/wardrobe.ico (16 to 256 px, embedded in Wardrobe.exe and the
+installer) and src/app/brand_mark.h (the same mark as raw RGBA, drawn by the
+windows themselves so it stays crisp at their size). Requires Pillow.
+"""
+import math
+from pathlib import Path
+
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+S = 1024  # drawing size; everything below is in these units
+
+VIOLET = (124, 92, 255)
+AZURE = (79, 180, 255)
+
+
+def squircle_mask(size, radius):
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=radius, fill=255)
+    return mask
+
+
+def gradient(size):
+    """Diagonal violet -> azure, with a soft light from the top-left corner."""
+    img = Image.new("RGB", (size, size))
+    px = img.load()
+    for y in range(size):
+        for x in range(size):
+            t = (x * 0.55 + y * 0.45) / size
+            r = VIOLET[0] + (AZURE[0] - VIOLET[0]) * t
+            g = VIOLET[1] + (AZURE[1] - VIOLET[1]) * t
+            b = VIOLET[2] + (AZURE[2] - VIOLET[2]) * t
+            # light source: brighter towards the top-left
+            light = max(0.0, 1.0 - math.hypot(x - size * 0.2, y - size * 0.1) / (size * 1.1)) * 0.22
+            px[x, y] = (int(min(255, r + 255 * light)), int(min(255, g + 255 * light)), int(min(255, b + 255 * light)))
+    return img
+
+
+def hanger(size, width, simple=False):
+    """White coat hanger, as an antialiased alpha mask.
+
+    The whole hanger is one centre line stamped with a round brush, so every
+    joint and end is round and the hook flows into the neck without a seam.
+    """
+    m = Image.new("L", (size, size), 0)
+    d = ImageDraw.Draw(m)
+    cx, w = size / 2, width
+    apex_y = size * 0.47
+    path = []
+    # hook: from its tip on the lower left, over the top, down the right, into the neck
+    hr = size * (0.06 if simple else 0.075)
+    hy = size * 0.30
+    start, end = (200, 450) if not simple else (230, 450)
+    for i in range(121):
+        a = math.radians(start + (end - start) * i / 120)
+        path.append((cx + hr * math.cos(a), hy + hr * math.sin(a)))
+    path.append((cx, apex_y))
+    left, right, base = (size * 0.17, size * 0.83, size * 0.70)
+    path += [(left, base), (right, base), (cx, apex_y)]
+
+    def stamp(points):
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            steps = max(1, int(math.hypot(x1 - x0, y1 - y0) / (w * 0.08)))
+            for k in range(steps + 1):
+                x, y = x0 + (x1 - x0) * k / steps, y0 + (y1 - y0) * k / steps
+                d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=255)
+    stamp(path)
+    return m
+
+
+def render(size):
+    big = S
+    base = gradient(256).resize((big, big), Image.BICUBIC)
+    mask = squircle_mask(big, int(big * 0.235))
+    icon = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    icon.paste(base, (0, 0), mask)
+    # a hairline of light along the top edge gives the tile a surface
+    rim = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(rim).rounded_rectangle((6, 6, big - 7, big - 7), radius=int(big * 0.225), outline=70, width=6)
+    rim = ImageChops.multiply(rim, Image.linear_gradient("L").resize((big, big)).transpose(Image.FLIP_TOP_BOTTOM))
+    icon = Image.composite(Image.new("RGBA", (big, big), (255, 255, 255, 255)), icon, rim)
+    icon.putalpha(ImageChops.multiply(icon.getchannel("A"), mask))
+    # the hanger, with a soft shadow beneath it
+    # Small icons get a heavier, simpler stroke so the hanger survives 16 px.
+    stroke = big * (0.11 if size <= 24 else 0.085 if size <= 32 else 0.07 if size <= 48 else 0.055)
+    glyph = hanger(big, stroke, simple=size <= 32)
+    shadow = glyph.filter(ImageFilter.GaussianBlur(big * 0.02))
+    shade = Image.new("RGBA", (big, big), (20, 10, 60, 0))
+    shade.putalpha(shadow.point(lambda v: int(v * 0.45)))
+    icon = Image.alpha_composite(icon, Image.new("RGBA", (big, big), (0, 0, 0, 0)).transform(
+        (big, big), Image.AFFINE, (1, 0, 0, 0, 1, -big * 0.012)))
+    shifted = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    shifted.paste(shade, (0, int(big * 0.014)))
+    icon = Image.alpha_composite(icon, shifted)
+    white = Image.new("RGBA", (big, big), (255, 255, 255, 0))
+    white.putalpha(glyph)
+    icon = Image.alpha_composite(icon, white)
+    return icon.resize((size, size), Image.LANCZOS)
+
+
+def main():
+    sizes = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
+    images = [render(s) for s in sizes]
+    ico = HERE / "wardrobe.ico"
+    images[-1].save(ico, format="ICO", sizes=[(s, s) for s in sizes], append_images=images[:-1])
+    render(512).save(HERE / "wardrobe.png")
+    mark = render(96)
+    raw = mark.tobytes()
+    lines = ["#pragma once", "#include <cstdint>", "",
+             "// Generated by assets/make_icon.py: Wardrobe's mark, 96x96 RGBA. Do not edit.",
+             "namespace wardrobe::brand {",
+             "inline constexpr int MarkSize = 96;",
+             "inline constexpr uint8_t Mark[] = {"]
+    for i in range(0, len(raw), 32):
+        lines.append("    " + ",".join(str(b) for b in raw[i:i + 32]) + ",")
+    lines += ["};", "}", ""]
+    (ROOT / "src" / "app" / "brand_mark.h").write_text("\n".join(lines), encoding="utf-8", newline="\n")
+    print(f"[OK] {ico}, assets/wardrobe.png, src/app/brand_mark.h")
+
+
+if __name__ == "__main__":
+    main()

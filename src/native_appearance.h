@@ -9,6 +9,12 @@ struct Status {
     uint64_t revision = 0, rebuilds = 0, gathers = 0, lastSeenMs = 0, wearableLists = 0;
     uint32_t prepareMs = 0, commitMs = 0;
     uint32_t registered = 0, known = 0, unavailable = 0, resyncs = 0;
+    // Animation choices the server made for its own model, and how many were
+    // translated onto the replacement model the outfit draws instead.
+    uint32_t animationsSeen = 0, animationsTranslated = 0;
+    // Alternate forms (a persona's dragon) drawn in place of the server's classic one.
+    uint32_t forms = 0;
+    char lastAnimation[128]{};
     uint32_t profileMoved = 0;
     bool profileExact = false;
     char profileDetail[96]{};

@@ -2,10 +2,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <tlhelp32.h>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 #include "../wardrobe_session.h"
 
@@ -231,6 +234,175 @@ inline std::string LastLogLine(const fs::path& file) {
         else if (line.size() > 1) last = line.substr(0, line.size() - 1);
     return last;
 }
+
+// ------------------------------------------------------------------ compatibility
+// Whether this Wardrobe works with the installed Dota is decided by
+// wardrobe_tools.exe, built from the same profile as the DLL in the same build:
+// its verdict is the DLL's own. Asking the app's compiled-in copy instead would
+// keep a stale answer after "Mettre à jour" rebuilds the DLL behind this window.
+enum class CompatState { Unknown, Checking, Compatible, Incompatible, NoTool, NoDota };
+struct Compatibility {
+    CompatState state = CompatState::Unknown;
+    bool exact = false;       // the very build the profile was recorded from
+    std::string failure;      // what no longer resolves, as the resolver names it
+};
+
+// Whether the catalog still holds every cosmetic of the installed Dota. A
+// content update adds items the catalog cannot offer until it is regenerated;
+// only real missing cosmetics count, not every edit Valve makes to the file.
+enum class FreshState { Unknown, Checking, UpToDate, Outdated, NoData };
+struct Freshness {
+    FreshState state = FreshState::Unknown;
+    size_t missing = 0;
+    std::vector<std::string> examples;   // a few names, for the sentence on the home screen
+};
+
+struct Captured { int exitCode = -1; std::string output; };
+
+// A short helper run to completion, hidden, with its output kept.
+inline Captured RunCaptured(std::wstring commandLine, DWORD timeoutMs) {
+    Captured result;
+    SECURITY_ATTRIBUTES inheritable{sizeof(inheritable), nullptr, TRUE};
+    HANDLE readEnd = nullptr, writeEnd = nullptr;
+    if (!CreatePipe(&readEnd, &writeEnd, &inheritable, 1 << 16)) return result;
+    SetHandleInformation(readEnd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    startup.hStdOutput = startup.hStdError = writeEnd;
+    PROCESS_INFORMATION process{};
+    const BOOL started = CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                                        nullptr, nullptr, &startup, &process);
+    CloseHandle(writeEnd);
+    if (!started) { CloseHandle(readEnd); return result; }
+    char buffer[4096];
+    DWORD read = 0;
+    while (ReadFile(readEnd, buffer, sizeof(buffer), &read, nullptr) && read) result.output.append(buffer, read);
+    CloseHandle(readEnd);
+    if (WaitForSingleObject(process.hProcess, timeoutMs) == WAIT_OBJECT_0) {
+        DWORD code = 1;
+        GetExitCodeProcess(process.hProcess, &code);
+        result.exitCode = int(code);
+    } else {
+        TerminateProcess(process.hProcess, 1);
+    }
+    CloseHandle(process.hProcess);
+    CloseHandle(process.hThread);
+    return result;
+}
+
+inline Compatibility ParseCompatibility(const Captured& run) {
+    Compatibility result;
+    const auto line = run.output.substr(0, run.output.find('\n'));
+    if (run.exitCode == 2 || line.rfind("compat resolved=", 0) != 0) {
+        result.state = CompatState::NoDota;
+        return result;
+    }
+    result.state = line.find("resolved=1") != std::string::npos ? CompatState::Compatible : CompatState::Incompatible;
+    result.exact = line.find("exact=1") != std::string::npos;
+    if (const auto at = line.find("failure="); at != std::string::npos) {
+        result.failure = line.substr(at + 8);
+        while (!result.failure.empty() && (result.failure.back() == '\r' || result.failure.back() == ' ')) result.failure.pop_back();
+    }
+    return result;
+}
+
+inline Freshness ParseFreshness(const Captured& run) {
+    Freshness result;
+    std::vector<std::string> lines;
+    for (size_t start = 0; start < run.output.size();) {
+        size_t end = run.output.find('\n', start);
+        if (end == std::string::npos) end = run.output.size();
+        std::string line = run.output.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+        start = end + 1;
+    }
+    if (run.exitCode == 2 || lines.empty() || lines[0].rfind("catalog missing=", 0) != 0) {
+        result.state = FreshState::NoData;
+        return result;
+    }
+    result.missing = strtoull(lines[0].c_str() + 16, nullptr, 10);
+    result.state = result.missing ? FreshState::Outdated : FreshState::UpToDate;
+    for (const auto& line : lines)
+        if (line.rfind("    ", 0) == 0 && result.examples.size() < 3) result.examples.push_back(line.substr(4));
+    return result;
+}
+
+// Both checks run wardrobe_tools.exe, built with the DLL, and each re-runs only
+// when one of its inputs changed (a Dota patch, a rebuild, a new catalog):
+// mapping a hundred megabytes every few seconds would be pure waste.
+class CompatWatch {
+public:
+    CompatWatch() : worker_([this] { Loop(); }) {}
+    ~CompatWatch() { stop_ = true; worker_.join(); }
+    Compatibility Current() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return current_;
+    }
+    Freshness Catalog() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return catalog_;
+    }
+    void Nudge() { forced_ = true; }
+
+private:
+    static std::wstring Stamp(const fs::path& file) {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (file.empty() || !GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &data)) return L"-";
+        return std::to_wstring(data.nFileSizeLow) + L":" + std::to_wstring(data.ftLastWriteTime.dwLowDateTime) + L":" +
+               std::to_wstring(data.ftLastWriteTime.dwHighDateTime);
+    }
+    void Set(const Compatibility& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_ = value;
+    }
+    void SetCatalog(const Freshness& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        catalog_ = value;
+    }
+    void Loop() {
+        std::wstring checked, checkedCatalog;
+        while (!stop_) {
+            const auto layout = Layout::Discover();
+            const auto tool = layout.Binary(L"wardrobe_tools.exe");
+            const auto game = DotaGameDirectory(FindProcess(L"dota2.exe").image);
+            auto client = game.empty() ? fs::path{} : game / "bin" / "win64" / "client.dll";
+            // For reviewing the screens only: check another file instead of the installed client.dll.
+            wchar_t forced[MAX_PATH]{};
+            if (GetEnvironmentVariableW(L"WARDROBE_TEST_CLIENT", forced, MAX_PATH)) client = forced;
+            const bool force = forced_.exchange(false);
+            const auto key = tool.wstring() + L"|" + Stamp(tool) + L"|" + client.wstring() + L"|" + Stamp(client);
+            if (tool.empty()) {
+                Set({CompatState::NoTool, false, {}});
+            } else if (client.empty()) {
+                Set({CompatState::NoDota, false, {}});
+            } else if (key != checked || force) {
+                if (key != checked) Set({CompatState::Checking, false, {}});
+                Set(ParseCompatibility(RunCaptured(L"\"" + tool.wstring() + L"\" compat \"" + client.wstring() + L"\"", 60000)));
+                checked = key;
+            }
+            // The catalog against the cosmetics in the game's own archive.
+            const auto catalog = layout.data / "skins_full.json";
+            const auto archive = game.empty() ? fs::path{} : game / "pak01_dir.vpk";
+            const auto catalogKey = tool.wstring() + L"|" + Stamp(tool) + L"|" + Stamp(archive) + L"|" + Stamp(catalog);
+            if (tool.empty() || game.empty()) {
+                SetCatalog({FreshState::NoData, 0, {}});
+            } else if (catalogKey != checkedCatalog || force) {
+                if (catalogKey != checkedCatalog) SetCatalog({FreshState::Checking, 0, {}});
+                SetCatalog(ParseFreshness(RunCaptured(L"\"" + tool.wstring() + L"\" catalog \"" + game.wstring() + L"\" \"" +
+                                                      catalog.wstring() + L"\"", 60000)));
+                checkedCatalog = catalogKey;
+            }
+            for (int i = 0; i < 40 && !stop_ && !forced_; ++i) Sleep(50);
+        }
+    }
+    mutable std::mutex mutex_;
+    Compatibility current_;
+    Freshness catalog_;
+    std::atomic<bool> stop_{false}, forced_{false};
+    std::thread worker_;
+};
 
 // ------------------------------------------------------------------ the whole picture
 struct Snapshot {

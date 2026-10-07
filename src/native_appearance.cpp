@@ -13,6 +13,7 @@
 #include "native_appearance_profile.h"
 #include "native_appearance_resolver.h"
 #include "diagnostics.h"
+#include "hero_models.h"
 #include "../thirdparty/minhook/include/MinHook.h"
 #pragma comment(lib, "bcrypt.lib")
 
@@ -44,7 +45,20 @@ struct Engine {
     bool (__fastcall* nameIsType)(void*, uint32_t) = nullptr;
     void (__fastcall* namePurge)(void*, int32_t) = nullptr;
     void* (__fastcall* entityModels)(void*) = nullptr;
+    // Animation: the entity's CModel, a CModel's activity -> sequences table, the
+    // n-th sequence of an activity in that table, and a sequence's descriptor.
+    void* (__fastcall* entityModel)(void*) = nullptr;
+    void* (__fastcall* activityMap)(void*) = nullptr;
+    int32_t* (__fastcall* activitySequence)(void*, int32_t*, int32_t, int32_t) = nullptr;
+    void* (__fastcall* sequenceDesc)(void*, int32_t) = nullptr;
+    // tier0 CUtlSymbolTable::String: an activity-modifier symbol back to its name.
+    const char* (__fastcall* symbolString)(void*, const uint16_t*) = nullptr;
 } engine;
+// Static game data (gen_hero_models.py). Pointers so the tests can stand in.
+const char* (*classicModel)(uint32_t) = &catalog::ClassicModel;
+const char* (*originalModel)(const char*) = &catalog::OriginalModel;
+bool (*alternateForm)(const char*) = &catalog::AlternateForm;
+const catalog::ItemActivity* (*itemActivities)(uint32_t, size_t&) = &catalog::ItemActivitiesFor;
 struct PointerList { int32_t count, padding; void** data; };
 // CResourceNameTyped: a 0xc8-byte inline CBufferString followed by the path
 // and type hashes. Callers zero it before the engine fills the hashes.
@@ -65,7 +79,9 @@ struct StagedOutfit {
 // keep checking it: the server owns the networked model, so the end of a
 // transformation or a full entity update can put the classic model back.
 uint64_t verifyAt = 0, checkAt = 0;
-constexpr uint64_t VerifyDelayMs = 2000, CheckIntervalMs = 500;
+// A hex or a transformation ending puts the classic model back until the next
+// check notices: keep that window short. A check is one model-name lookup.
+constexpr uint64_t VerifyDelayMs = 2000, CheckIntervalMs = 150;
 std::vector<std::string> committedPaths;
 std::vector<void*> committedModels;
 std::string committedBase;
@@ -240,10 +256,20 @@ void CaptureSpawnModel(void* hero, void* kv) {
     const auto entity = EntityKey(hero, *reinterpret_cast<uint32_t*>(identity + profile::IdentityHandle));
     const auto heroId = *reinterpret_cast<uint32_t*>(uintptr_t(hero) + profile::HeroId);
     if (!heroId || heroId >= heroBaselines.size()) return;
-    // Capture before inventory modifiers can replace the render/base model.
-    // Empty KVs from a live update must never overwrite this spawn baseline.
+    // The game data names the model the server networks. Observing it instead
+    // once recorded Dragon Knight's dragon as his classic model, so every return
+    // to human then looked like a transformation and was left classic.
+    if (const char* classic = classicModel ? classicModel(heroId) : nullptr) {
+        strncpy_s(baselineModel.data(), baselineModel.size(), classic, _TRUNCATE);
+        baselineEntity = entity;
+        heroBaselines[heroId] = classic;
+        return;
+    }
+    // A hero newer than the generated table: capture before inventory modifiers
+    // can replace the render/base model. Empty KVs from a live update must never
+    // overwrite this spawn baseline, and neither may an alternate form.
     const char* model = kv && engine.kvModel ? engine.kvModel(kv, nullptr) : nullptr;
-    if (model && *model && !ErrorModel(model) &&
+    if (model && *model && !ErrorModel(model) && !alternateForm(model) &&
         (heroBaselines[heroId].empty() || ModelMatches(model, heroBaselines[heroId]))) {
         strncpy_s(baselineModel.data(), baselineModel.size(), model, _TRUNCATE);
         baselineEntity = entity;
@@ -307,6 +333,7 @@ bool CaptureBaseline(void* hero, uint64_t entity) {
     const auto heroId = *reinterpret_cast<uint32_t*>(uintptr_t(hero) + profile::HeroId);
     if (!heroId || heroId >= heroBaselines.size()) return false;
     baselineModel.fill(0);
+    if (const char* classic = classicModel ? classicModel(heroId) : nullptr) heroBaselines[heroId] = classic;
     // Entity handles change on reconnect. Preserve the known original model
     // for each hero instead of learning an error/persona as the new baseline.
     if (!heroBaselines[heroId].empty()) {
@@ -322,7 +349,7 @@ bool CaptureBaseline(void* hero, uint64_t entity) {
     name(info, handle, baselineModel.data(), uint32_t(baselineModel.size()));
     baselineModel.back() = 0;
     baselineEntity = entity;
-    if (ErrorModel(baselineModel.data())) baselineModel.fill(0);
+    if (ErrorModel(baselineModel.data()) || alternateForm(baselineModel.data())) baselineModel.fill(0);
     if (baselineModel[0]) heroBaselines[heroId] = baselineModel.data();
     return baselineModel[0] != 0;
 }
@@ -492,8 +519,7 @@ bool CommitWearables(void* hero, const Snapshot& snapshot, uint32_t heroId) {
     return *reinterpret_cast<int32_t*>(uintptr_t(hero) + profile::WearableCount) > 0;
 }
 
-void RecordRenderModel(void* hero, char (&name)[264]) {
-    // The HUD reports only native acceptance; this reads what Dota draws.
+void RenderName(void* hero, char (&name)[264]) {
     const auto info = *reinterpret_cast<void**>(base + profile::ModelInfo);
     void* handle = nullptr;
     if (engine.modelHandle) engine.modelHandle(hero, &handle);
@@ -502,8 +528,239 @@ void RecordRenderModel(void* hero, char (&name)[264]) {
         auto text = reinterpret_cast<void(__fastcall*)(void*, void*, char*, uint32_t)>((*static_cast<void***>(info))[profile::ModelNameSlot]);
         text(info, handle, name, uint32_t(sizeof(name))); name[sizeof(name) - 1] = 0;
     }
+}
+void RecordRenderModel(void* hero, char (&name)[264]) {
+    // The HUD reports only native acceptance; this reads what Dota draws.
+    RenderName(hero, name);
     std::lock_guard<std::mutex> lock(statusMutex);
     strcpy_s(status.renderModel, name);
+}
+
+// The server animates the model it knows. C_DOTA_BaseNPC networks an activity
+// and a variant: the index of the chosen sequence in that activity's list in
+// the server's model. On a replacement model the list differs (Razor's arcana
+// has four times as many sequences, in another order), so the same index picks
+// an unrelated sequence: a backwards lash while running, an idle while moving.
+// Before Dota resolves the pair, the variant is rewritten to the replacement's
+// sequence that the engine's own modifier match would pick for the modifiers
+// of the server's choice ("haste", "injured", "attacking_run"...).
+// The server never hears of the outfit's items either, so it never asks for
+// the animations they unlock (a peg leg's run, a spear's attacks, an arcana's
+// stance). Their modifiers are added here, even on the classic model.
+using NetworkActivityFn = void(__fastcall*)(void*, bool);
+NetworkActivityFn originalNetworkActivity = nullptr;
+// References to the models the server animates (a hero's classic model, a
+// persona's original dragon), held while the outfit is equipped.
+std::vector<std::string> originPaths;
+std::vector<void*> originModels;
+constexpr int32_t MaxCandidates = 64, MaxModifiers = 16, MaxWanted = 64, NoTranslation = -1;
+// The outfit's own animation modifiers (gen_hero_models.py), resolved at commit.
+std::vector<const catalog::ItemActivity*> outfitActivities;
+void ReleaseOrigins() { ReleaseModels(originModels); originPaths.clear(); }
+void RememberActivities(const Snapshot& snapshot, uint32_t heroId) {
+    outfitActivities.clear();
+    for (const auto& selection : snapshot.selections) {
+        if (selection.hero != heroId || selection.slot >= 32 || !selection.item || !selection.definition) continue;
+        size_t count = 0;
+        const auto entries = itemActivities(selection.definition, count);
+        for (size_t i = 0; entries && i < count; ++i)
+            if (entries[i].style < 0 || uint32_t(entries[i].style) == selection.style) outfitActivities.push_back(&entries[i]);
+    }
+}
+bool UsableModel(void* handle) {
+    const auto info = *reinterpret_cast<void**>(base + profile::ModelInfo);
+    if (!handle || !info || !engine.modelReady(handle) || !*static_cast<void**>(handle)) return false;
+    char name[264]{};
+    reinterpret_cast<void(__fastcall*)(void*, void*, char*, uint32_t)>((*static_cast<void***>(info))[profile::ModelNameSlot])(
+        info, handle, name, uint32_t(sizeof(name)));
+    name[sizeof(name) - 1] = 0;
+    return *name && !ErrorModel(name);
+}
+// Classic models are precached by the server, so this is a lookup. A null
+// handle is not kept, so the next animation change asks again; one still
+// loading is kept and simply stays unused until UsableModel accepts it.
+void* AcquireModel(const char* path) {
+    for (size_t i = 0; i < originPaths.size(); ++i) if (originPaths[i] == path) return originModels[i];
+    const auto info = *reinterpret_cast<void**>(base + profile::ModelInfo);
+    if (!info || originPaths.size() >= 8) return nullptr;
+    RegisterModel(path);
+    void* model = nullptr;
+    reinterpret_cast<void*(__fastcall*)(void*, void**, const char*)>((*static_cast<void***>(info))[profile::FindOrLoadSlot])(info, &model, path);
+    if (!model) return nullptr;
+    InterlockedIncrement(reinterpret_cast<LONG*>(uintptr_t(model) + profile::ModelRefCount));
+    originPaths.emplace_back(path); originModels.push_back(model);
+    return model;
+}
+template <typename T, typename... Args> T SequenceCall(void* desc, uintptr_t slot, Args... args) {
+    return reinterpret_cast<T(__fastcall*)(void*, Args...)>((*static_cast<void***>(desc))[slot])(desc, args...);
+}
+// Every sequence the engine lists for the activity, in its variant order.
+int32_t SequencesFor(void* model, int32_t activity, int32_t (&out)[MaxCandidates]) {
+    const auto map = engine.activityMap(model);
+    if (!map) return 0;
+    int32_t count = 0;
+    for (int32_t variant = 0; variant < MaxCandidates; ++variant) {
+        int32_t sequence = 0;
+        engine.activitySequence(map, &sequence, variant, activity);
+        if (count && sequence == out[count - 1]) break;   // the engine clamps past the end
+        // A missing activity yields sequence 0, which is then not one of its own.
+        const auto desc = engine.sequenceDesc(model, sequence);
+        if (!desc || SequenceCall<int32_t>(desc, profile::ActivityCountSlot) < 1 ||
+            SequenceCall<int32_t>(desc, profile::ActivityIdSlot, int32_t(0)) != activity) break;
+        out[count++] = sequence;
+    }
+    return count;
+}
+// Entry 0 of a sequence's activity list is the activity; the others are its modifiers.
+int32_t ModifiersOf(void* model, int32_t sequence, const char* (&names)[MaxModifiers]) {
+    const auto desc = engine.sequenceDesc(model, sequence);
+    const int32_t entries = desc ? SequenceCall<int32_t>(desc, profile::ActivityCountSlot) : 0;
+    int32_t count = 0;
+    for (int32_t i = 1; i < entries && count < MaxModifiers; ++i)
+        if (const auto name = SequenceCall<const char*>(desc, profile::ActivityNameSlot, i); name && *name) names[count++] = name;
+    return count;
+}
+struct Wanted {
+    const char* names[MaxWanted];
+    int32_t count = 0;
+    void Add(const char* name) {
+        if (!name || !*name || count >= MaxWanted) return;
+        for (int32_t i = 0; i < count; ++i) if (!_stricmp(names[i], name)) return;
+        names[count++] = name;
+    }
+    bool Has(const char* name) const {
+        for (int32_t i = 0; i < count; ++i) if (!_stricmp(names[i], name)) return true;
+        return false;
+    }
+};
+// The client's own list for the hero: attack and movement speed ("fast",
+// "run_fast"), health ("injured"), team, buffs. The server's equivalents only
+// reach us through its choice on the classic model, which may have no sequence
+// expressing them while the replacement does.
+void AddClientModifiers(void* npc, Wanted& wanted) {
+    if (!engine.symbolString) return;
+    const int32_t count = *reinterpret_cast<int32_t*>(uintptr_t(npc) + profile::ActivityModifiersCount);
+    const auto symbols = *reinterpret_cast<const uint16_t* const*>(uintptr_t(npc) + profile::ActivityModifiersData);
+    if (count <= 0 || count > MaxWanted || !symbols) return;
+    const auto table = reinterpret_cast<void*>(base + profile::ModifierSymbols);
+    for (int32_t i = 0; i < count; ++i) if (symbols[i] != 0xffff) wanted.Add(engine.symbolString(table, &symbols[i]));
+}
+// Same rule as the engine's own match (SelectFromModifiers): a sequence is
+// eligible only if every one of its modifiers is wanted, and scores 1 + 10 per
+// matched modifier. The variant index returned is in the target's list.
+// Wanted: the modifiers of the server's choice, the outfit's item modifiers
+// for this activity, and, on a replacement model, the client's own list.
+int32_t TranslateVariant(void* npc, void* source, void* target, int32_t activity, int32_t variant) {
+    int32_t from[MaxCandidates], to[MaxCandidates];
+    const int32_t fromCount = SequencesFor(source, activity, from);
+    const bool replaced = source != target;
+    const int32_t toCount = !fromCount ? 0 : replaced ? SequencesFor(target, activity, to) : fromCount;
+    if (!fromCount || !toCount) return NoTranslation;
+    if (!replaced) memcpy(to, from, sizeof(int32_t) * size_t(fromCount));
+    const int32_t chosen = from[std::clamp(variant, 0, fromCount - 1)];
+    Wanted wanted;
+    const char* server[MaxModifiers];
+    const int32_t serverCount = ModifiersOf(source, chosen, server);
+    for (int32_t i = 0; i < serverCount; ++i) wanted.Add(server[i]);
+    const auto desc = engine.sequenceDesc(source, chosen);
+    const char* activityName = desc ? SequenceCall<const char*>(desc, profile::ActivityNameSlot, int32_t(0)) : nullptr;
+    for (const auto entry : outfitActivities)
+        if (!_stricmp(entry->activity, "ALL") || (activityName && !_stricmp(entry->activity, activityName))) wanted.Add(entry->modifier);
+    if (replaced) AddClientModifiers(npc, wanted);
+    // On the server's own model, nothing it did not already ask for: its pick stands.
+    if (!replaced && wanted.count == serverCount) return NoTranslation;
+    int32_t ties[MaxCandidates], tieCount = 0, best = 0;
+    int32_t fallback = NoTranslation, fallbackMissing = MaxModifiers + 1, fallbackMatched = -1;
+    bool chosenTies = false;
+    for (int32_t i = 0; i < toCount; ++i) {
+        const char* names[MaxModifiers];
+        const int32_t count = ModifiersOf(target, to[i], names);
+        int32_t matched = 0;
+        for (int32_t k = 0; k < count; ++k) if (wanted.Has(names[k])) ++matched;
+        if (matched == count) {
+            const int32_t score = 1 + 10 * matched;
+            if (score > best) { best = score; tieCount = 0; chosenTies = false; }
+            if (score == best) { ties[tieCount++] = i; chosenTies |= !replaced && to[i] == chosen; }
+        } else if (count - matched < fallbackMissing || (count - matched == fallbackMissing && matched > fallbackMatched)) {
+            // Nothing fully eligible: the closest one beats an unrelated sequence.
+            fallback = i; fallbackMissing = count - matched; fallbackMatched = matched;
+        }
+    }
+    // The server's pick is as good as any on its own model: keep its random draw.
+    if (chosenTies) return NoTranslation;
+    // Among equals the server's own draw keeps varying the pick, as it does natively.
+    return tieCount ? ties[(variant > 0 ? variant : 0) % tieCount] : replaced ? fallback : NoTranslation;
+}
+int32_t TranslateNetworkVariant(void* npc) {
+    if (npc != trackedHero || committedPaths.empty() || !engine.entityModel || !engine.activityMap ||
+        !engine.activitySequence || !engine.sequenceDesc) return NoTranslation;
+    const int32_t activity = *reinterpret_cast<int32_t*>(uintptr_t(npc) + profile::NetworkActivityField);
+    const int32_t variant = *reinterpret_cast<int32_t*>(uintptr_t(npc) + profile::NetworkSequenceField);
+    if (activity < 1) return NoTranslation;
+    // Which committed model is drawn, and which model is the server animating?
+    char name[264];
+    RenderName(npc, name);
+    const char* original = nullptr;
+    for (const auto& path : committedPaths) if (ModelMatches(name, path)) {
+        original = path == committedBase ? baselineModel.data() : originalModel(path.c_str());
+        break;
+    }
+    if (!original || !*original) return NoTranslation;
+    void* target = engine.entityModel(npc);
+    if (!target) return NoTranslation;
+    void* source = target;
+    if (!ModelMatches(name, original)) {
+        const auto handle = AcquireModel(original);
+        if (!UsableModel(handle)) return NoTranslation;
+        source = *static_cast<void**>(handle);
+    } else if (outfitActivities.empty()) {
+        return NoTranslation;   // the server's own model and nothing to add
+    }
+    const int32_t result = TranslateVariant(npc, source, target, activity, variant);
+    std::lock_guard<std::mutex> lock(statusMutex);
+    ++status.animationsSeen;
+    if (result != NoTranslation && result != variant) {
+        ++status.animationsTranslated;
+        sprintf_s(status.lastAnimation, "activité %d : variante %d -> %d", activity, variant, result);
+    }
+    return result;
+}
+// Dota leaves a cosmetic's alternate form to the server, which does not know
+// the outfit: under the persona, Elder Dragon Form drew the classic dragon. The
+// outfit already holds the replacement (a hero_model_change), loaded and
+// referenced, so draw it as soon as the server's original form appears.
+void __fastcall OnNetworkActivity(void* npc, bool reset);
+bool SwapAlternateForm(void* hero, const char* name) {
+    if (!*name || committedPaths.size() != committedModels.size()) return false;
+    for (size_t i = 1; i < committedPaths.size(); ++i) {
+        const auto& path = committedPaths[i];
+        const char* original = path == committedBase ? nullptr : originalModel(path.c_str());
+        if (!original || !ModelMatches(name, original) || !UsableModel(committedModels[i])) continue;
+        engine.setModel(hero, path.c_str());
+        if (originalNetworkActivity) OnNetworkActivity(hero, false);
+        std::lock_guard<std::mutex> lock(statusMutex);
+        ++status.forms;
+        return true;
+    }
+    return false;
+}
+int32_t GuardedNetworkVariant(void* npc) {
+    __try { return TranslateNetworkVariant(npc); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return NoTranslation; }
+}
+void __fastcall OnNetworkActivity(void* npc, bool reset) {
+    // Only the call that resolves the pair sees the translated index; the
+    // networked value is restored at once so change detection stays native.
+    auto& field = *reinterpret_cast<int32_t*>(uintptr_t(npc) + profile::NetworkSequenceField);
+    const int32_t raw = field;
+    const int32_t translated = GuardedNetworkVariant(npc);
+    if (translated != NoTranslation && translated != raw) {
+        field = translated;
+        originalNetworkActivity(npc, reset);
+        field = raw;
+        return;
+    }
+    originalNetworkActivity(npc, reset);
 }
 void __fastcall OnThink(void* hero) {
     originalThink(hero);
@@ -526,7 +783,8 @@ void __fastcall OnThink(void* hero) {
         // Re-resolve every resource after an entity/session restart. Do not
         // reuse a completed stage or assume the old manifest still exists.
         ReleaseModels(committedModels);
-        if (newEntity) { committedPaths.clear(); committedBase.clear(); }
+        ReleaseOrigins();
+        if (newEntity) { committedPaths.clear(); committedBase.clear(); outfitActivities.clear(); }
     }
     trackedHero = hero; trackedEntity = entity; lastLocalThink = now;
     seenSpawnGeneration = spawnGeneration;
@@ -534,6 +792,11 @@ void __fastcall OnThink(void* hero) {
     if (changed) {
         ReleaseStaged(); verifyAt = 0; checkAt = now + CheckIntervalMs;
         std::lock_guard<std::mutex> lock(statusMutex);
+        if (status.hero != heroId) {
+            // The previous hero's models would otherwise be logged under this one.
+            status.baseModel[0] = status.selectedModel[0] = status.renderModel[0] = status.lastAnimation[0] = 0;
+            status.animationsSeen = status.animationsTranslated = status.forms = 0;
+        }
         status.phase = Phase::Pending; status.hero = heroId; status.revision = snapshot->revision;
         status.expected = uint32_t(HeroSelections(*snapshot, heroId)); status.matched = 0; status.attempts = 0;
     }
@@ -553,14 +816,18 @@ void __fastcall OnThink(void* hero) {
         const bool rebuilt = CommitWearables(hero, *snapshot, heroId);
         const auto elapsed = GetTickCount64() - begin;
         RememberCommitted(staged.paths);
+        RememberActivities(*snapshot, heroId);
         ReleaseModels(committedModels);
         committedModels = std::move(staged.models);
         ReleaseStaged(); scheduler.Complete(); verifyAt = now + VerifyDelayMs; checkAt = 0;
-        std::lock_guard<std::mutex> lock(statusMutex);
-        ++status.rebuilds; status.commitMs = uint32_t(elapsed);
-        status.phase = rebuilt ? Phase::Prepared : Phase::MissingItems;
-        status.matched = rebuilt ? status.expected : 0;
-        status.views = rebuilt ? uint32_t(reinterpret_cast<NativeVector*>(uintptr_t(hero) + profile::CreationList)->count) : 0;
+        { std::lock_guard<std::mutex> lock(statusMutex);
+          ++status.rebuilds; status.commitMs = uint32_t(elapsed);
+          status.phase = rebuilt ? Phase::Prepared : Phase::MissingItems;
+          status.matched = rebuilt ? status.expected : 0;
+          status.views = rebuilt ? uint32_t(reinterpret_cast<NativeVector*>(uintptr_t(hero) + profile::CreationList)->count) : 0; }
+        // The sequence playing now was resolved against the previous model; the
+        // next networked change could be seconds away for a hero standing still.
+        if (originalNetworkActivity) OnNetworkActivity(hero, false);
     } else if (staged.list.data && now - staged.started > 10000) {
         ReleaseStaged(); scheduler.Complete(); checkAt = now + CheckIntervalMs; SetPhase(Phase::MissingItems);
     }
@@ -568,6 +835,7 @@ void __fastcall OnThink(void* hero) {
         char name[264]; verifyAt = 0; checkAt = now + CheckIntervalMs; RecordRenderModel(hero, name);
     } else if (checkAt && now >= checkAt && !staged.list.data && (scheduler.CompleteState() || scheduler.Exhausted())) {
         char name[264]; checkAt = now + CheckIntervalMs; RecordRenderModel(hero, name);
+        if (SwapAlternateForm(hero, name)) RecordRenderModel(hero, name);
         const bool wearablesMissing = *reinterpret_cast<int32_t*>(uintptr_t(hero) + profile::WearableCount) <= 0;
         const bool failed = NativeStatus().phase == Phase::MissingItems || scheduler.Exhausted();
         const bool mismatch = *name && !TemporaryForm(name) &&
@@ -621,9 +889,15 @@ void InitializeNative() {
     NATIVE_MEMBER(modelReady, ModelReady); NATIVE_MEMBER(viewModel, ViewModel);
     NATIVE_MEMBER(nameCtor, ResourceNameCtor); NATIVE_MEMBER(nameIsType, ResourceNameIsType);
     NATIVE_MEMBER(entityModels, EntityModelModifiers);
+    NATIVE_MEMBER(entityModel, EntityModel); NATIVE_MEMBER(activityMap, ActivityMap);
+    NATIVE_MEMBER(activitySequence, ActivitySequence); NATIVE_MEMBER(sequenceDesc, SequenceDesc);
 #undef NATIVE_MEMBER
-    if (const auto tier0 = GetModuleHandleW(L"tier0.dll"))
+    if (const auto tier0 = GetModuleHandleW(L"tier0.dll")) {
         engine.namePurge = reinterpret_cast<decltype(engine.namePurge)>(GetProcAddress(tier0, "?Purge@CBufferString@@QEAAXH@Z"));
+        // Takes the symbol by address, as client.dll's own calls pass it.
+        engine.symbolString = reinterpret_cast<decltype(engine.symbolString)>(
+            GetProcAddress(tier0, "?String@CUtlSymbolTable@@QEBAPEBDVCUtlSymbol@@@Z"));
+    }
     lookupTls = TlsAlloc();
     if (lookupTls == TLS_OUT_OF_INDEXES) { SetPhase(Phase::HookFailed); return; }
     struct Hook { uintptr_t offset; void* detour; void** original; };
@@ -632,7 +906,8 @@ void InitializeNative() {
         {profile::EquippedView, reinterpret_cast<void*>(&OnEquipped), reinterpret_cast<void**>(&originalEquipped)},
         {profile::BuildSpawnWearableList, reinterpret_cast<void*>(&OnSpawnList), reinterpret_cast<void**>(&originalSpawnList)},
         {profile::BuildWearableList, reinterpret_cast<void*>(&OnBuildList), reinterpret_cast<void**>(&originalBuildList)},
-        {profile::Think, reinterpret_cast<void*>(&OnThink), reinterpret_cast<void**>(&originalThink)}
+        {profile::Think, reinterpret_cast<void*>(&OnThink), reinterpret_cast<void**>(&originalThink)},
+        {profile::NetworkActivity, reinterpret_cast<void*>(&OnNetworkActivity), reinterpret_cast<void**>(&originalNetworkActivity)}
     };
     size_t created = 0;
     for (const auto& hook : hooks) {
@@ -660,18 +935,23 @@ void TickNativeDiagnostics() {
     const auto value = NativeStatus();
     if (value.phase == previous.phase && value.hero == previous.hero && value.revision == previous.revision &&
         value.rebuilds == previous.rebuilds && value.matched == previous.matched && value.wearableLists == previous.wearableLists &&
-        value.resyncs == previous.resyncs && !strcmp(value.renderModel, previous.renderModel)) return;
+        value.resyncs == previous.resyncs && value.forms == previous.forms && !strcmp(value.renderModel, previous.renderModel) &&
+        // A hero translates several animations a second: log the 1st, 2nd, 4th, 8th...
+        (value.animationsTranslated == previous.animationsTranslated ||
+         (value.animationsTranslated & (value.animationsTranslated - 1)) != 0)) return;
     previous = value;
     CreateDirectoryA("C:\\Temp", nullptr); CreateDirectoryA("C:\\Temp\\opencode", nullptr);
     RotateLogIfLarge("C:\\Temp\\opencode\\wardrobe_appearance.log");
     FILE* file = nullptr;
     fopen_s(&file, "C:\\Temp\\opencode\\wardrobe_appearance.log", "a");
     if (!file) return;
-    fprintf(file, "%llu pid=%lu phase=%u hero=%u revision=%llu matched=%u/%u attempts=%u rebuilds=%llu gathers=%llu views=%u lists=%llu prepareMs=%u commitMs=%u registered=%u known=%u unavailable=%u resyncs=%u base=%s model=%s render=%s %s\n",
+    fprintf(file, "%llu pid=%lu phase=%u hero=%u revision=%llu matched=%u/%u attempts=%u rebuilds=%llu gathers=%llu views=%u lists=%llu prepareMs=%u commitMs=%u registered=%u known=%u unavailable=%u resyncs=%u anims=%u/%u forms=%u base=%s model=%s render=%s %s%s%s\n",
         GetTickCount64(), GetCurrentProcessId(), unsigned(value.phase), value.hero, value.revision,
         value.matched, value.expected, value.attempts, value.rebuilds, value.gathers, value.views, value.wearableLists,
         value.prepareMs, value.commitMs, value.registered, value.known, value.unavailable, value.resyncs,
-        value.baseModel, value.selectedModel, value.renderModel, PhaseText(value.phase));
+        value.animationsTranslated, value.animationsSeen, value.forms,
+        value.baseModel, value.selectedModel, value.renderModel, PhaseText(value.phase),
+        value.lastAnimation[0] ? " | " : "", value.lastAnimation);
     fclose(file);
 }
 const char* PhaseText(Phase phase) {

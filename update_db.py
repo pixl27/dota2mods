@@ -7,7 +7,8 @@ usage: python update_db.py [--dota <...\dota 2 beta\game\dota>] [--all-global] [
 2. extracts scripts/items/items_game.txt, resource/localization/items_english.txt
    and dota_english.txt from pak01 into data/ (no manual copying);
 3. runs gen_full_db.py and gen_names.py;
-4. runs verify_profile.py so an appearance-profile mismatch is visible now.
+4. regenerates src/hero_models.h (gen_hero_models.py) when the sources are present;
+5. runs verify_profile.py so an appearance-profile mismatch is visible now.
 
 Run build.bat afterwards so build\data\skins_full.json is refreshed.
 """
@@ -55,6 +56,9 @@ def main(argv=None):
         [python, str(HERE / "gen_full_db.py"), "--items-game", str(data / "items_game.txt")] + (["--all-global"] if args.all_global else []),
         [python, str(HERE / "gen_names.py"), "--localization", str(data / "items_english.txt"), str(data / "dota_english.txt")],
     ]
+    # The hero/model tables are compiled into the DLL: only a copy with sources can use them.
+    if (HERE / "src").is_dir() and (HERE / "gen_hero_models.py").exists():
+        steps.append([python, str(HERE / "gen_hero_models.py"), "--dota", str(game)])
     try:
         for step in steps:
             result = subprocess.run(step)

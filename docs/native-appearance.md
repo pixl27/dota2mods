@@ -36,7 +36,7 @@ le modele. Les autres remplacements `entity_model` de la tenue (forme de
 dragon d'une persona, par exemple) sont enregistres et charges en meme temps,
 car une transformation passe aussi par `SetModel(chemin)`. Deux secondes
 apres un commit, le nom du modele reellement rendu est relu et affiche (HUD
-et journal, champ `render=`), puis verifie toutes les 500 ms : le serveur
+et journal, champ `render=`), puis verifie toutes les 150 ms : le serveur
 reste proprietaire du modele reseau, et la fin d'une transformation ou une
 mise a jour complete de l'entite peut remettre le modele classique. Dans ce
 cas la tenue est re-appliquee par le chemin normal. Un modele temporaire
@@ -66,6 +66,54 @@ Le retour a une tenue classique restaure le modele visible ET la reference du
 combineur ; conserver la reference de la persona melangeait deux squelettes.
 Les objets du catalogue ont une position d'inventaire stable non nulle pour
 eviter la notification de nouveaux objets a chaque reponse Equip.
+
+## Modele classique, formes alternatives et animations
+
+Le modele classique d'un heros n'est plus observe : il vient des donnees du jeu
+(`src/hero_models.h`, genere par `gen_hero_models.py` depuis
+`scripts/npc/heroes/*.txt`, et relance par `update_db.py`). L'observer avait
+enregistre le dragon de Dragon Knight comme modele classique : chaque retour a
+l'humain passait alors pour une transformation et le DK classique restait
+affiche plusieurs minutes. Un heros plus recent que la table retombe sur
+l'observation, qui refuse desormais toute forme alternative connue.
+
+La meme table liste, pour chaque cosmetique qui remplace un modele de heros
+(`entity_model`, `hero_model_change` dans items_game), le modele remplace.
+Quand le serveur affiche la forme d'origine (le dragon classique sous la
+persona), la forme de la tenue, deja chargee, est appliquee par `SetModel`
+(`forms=` dans le journal). Dota ne le fait pas seul : le serveur ne connait
+pas la tenue.
+
+Animations : `C_DOTA_BaseNPC` recoit une activite (`m_NetworkActivity`) et une
+variante (`m_NetworkSequenceIndex`), qui n'est pas un numero de sequence mais
+le rang de la sequence choisie dans la liste de cette activite du modele du
+serveur (`ActivitySequence` borne ce rang). Sur un modele de remplacement la
+liste differe (l'arcana de Razor a quatre fois plus de sequences), donc le
+meme rang jouait une autre sequence. Le hook de `NetworkActivity` (la seule
+fonction qui resout la paire) remplace la variante, le temps de cet appel, par
+celle que la regle native de `SelectFromModifiers` choisirait sur le modele
+de remplacement pour les modificateurs de la sequence du serveur (`haste`,
+`injured`, `attacking_run`...) : une sequence n'est eligible que si tous ses
+modificateurs sont demandes, et vaut 1 + 10 par modificateur trouve. Entre
+candidates egales, la variante du serveur garde la variete de son tirage.
+La valeur reseau est restauree aussitot, la detection de changement reste
+native. Apres chaque commit la sequence en cours est resolue a nouveau.
+Compteur : `anims=traduites/vues` dans le journal et le HUD.
+
+Le serveur n'entend jamais parler des objets de la tenue : il ne demande donc
+pas les animations qu'ils debloquent (la course d'une jambe de bois, les
+attaques d'une lance, la posture d'une arcana). Les modificateurs souhaites
+reunissent donc : ceux de la sequence choisie par le serveur ; ceux des objets
+equipes pour cette activite (`ItemActivities` dans `src/hero_models.h`, blocs
+`activity` d'items_game, filtres par style) ; et, sur un modele de
+remplacement, la liste que le client tient lui-meme pour le heros
+(`m_ActivityModifiers`, symboles relus via `CUtlSymbolTable::String` de tier0 :
+`fast`, `run_fast`, `injured`...), que le modele classique ne sait souvent pas
+exprimer. Sur le modele classique, seuls les objets ajoutent quelque chose, et
+le choix du serveur est garde des qu'il fait partie des meilleurs.
+
+Non verifie en partie au moment de l'ecriture : le rendu visuel des
+animations traduites et de la forme de dragon de la persona.
 
 ## Profil binaire et mises a jour de Dota
 

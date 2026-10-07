@@ -64,10 +64,10 @@ static void __fastcall Prepare(void* hero, void* kv, void* resources) {
 static void __fastcall Create(void* hero, void*) {
     ++createdCalls;
     auto list = reinterpret_cast<appearance::NativeVector*>(uintptr_t(hero) + appearance::profile::CreationList);
-    *reinterpret_cast<int32_t*>(uintptr_t(hero) + 0xad8) = list->count;
+    *reinterpret_cast<int32_t*>(uintptr_t(hero) + appearance::profile::WearableCount) = list->count;
     rendered = *static_cast<appearance::RenderSlot*>(reinterpret_cast<appearance::CreationEntry*>(list->data)[0].view);
 }
-static void __fastcall Destroy(void* hero) { ++destroyedCalls; *reinterpret_cast<int32_t*>(uintptr_t(hero) + 0xad8) = 0; }
+static void __fastcall Destroy(void* hero) { ++destroyedCalls; *reinterpret_cast<int32_t*>(uintptr_t(hero) + appearance::profile::WearableCount) = 0; }
 static void __fastcall ModifierDtor(void* data, uint32_t) { HeapFree(GetProcessHeap(), 0, data); }
 static void* __fastcall ModifierCtor(void* data) {
     static void* table[] = {reinterpret_cast<void*>(ModifierDtor)};
@@ -76,18 +76,20 @@ static void* __fastcall ModifierCtor(void* data) {
 }
 static void* __fastcall ModifierManager() { return nullptr; }
 static void __fastcall Populate(void*, void*, int32_t count, void** views) { Check(count > 0 && views[0], "Native modifiers receive the filtered creation views"); }
+// An outfit of plain items keeps the classic model.
+static bool noReplacement = false;
 static void* __fastcall ModelOverride(void*, void*) {
     struct Override { void* unused[2]; const char* path; }; static Override model{{}, "persona.vmdl"};
-    return createdSelection && createdSelection->item ? &model : nullptr;
+    return !noReplacement && createdSelection && createdSelection->item ? &model : nullptr;
 }
-static std::array<uint8_t, 0x28> personaResource{}, defaultResource{}, wearableResource{}, errorResource{}, dragonResource{};
+static std::array<uint8_t, 0x28> personaResource{}, defaultResource{}, wearableResource{}, errorResource{}, dragonResource{}, classicDragonResource{};
 static void* ResourceFor(const char* path);
 static void* currentModel = nullptr;
 static void __fastcall SetModel(void*, const char* model) { modelName = model; currentModel = ResourceFor(model); }
 static void* __fastcall ModelHandle(void*, void** handle) { *handle = currentModel ? currentModel : reinterpret_cast<void*>(1); return handle; }
 static void __fastcall ModelName(void*, void* handle, char* output, uint32_t size) {
     strcpy_s(output, size, handle == personaResource.data() ? "persona.vmdl" : handle == wearableResource.data() ? "wearable.vmdl" :
-        handle == errorResource.data() ? "models/dev/error.vmdl" : handle == dragonResource.data() ? "dragon.vmdl" : "default.vmdl");
+        handle == errorResource.data() ? "models/dev/error.vmdl" : handle == dragonResource.data() ? "dragon.vmdl" : handle == classicDragonResource.data() ? "classic_dragon.vmdl" : "default.vmdl");
 }
 static bool ready = true;
 static bool failModelLoad = false;
@@ -96,7 +98,7 @@ static std::set<std::string> registeredModels;
 static unsigned nameCtors = 0, namePurges = 0, manifestAdds = 0, handleFinds = 0;
 static void* ResourceFor(const char* path) {
     return !strcmp(path,"default.vmdl") ? defaultResource.data() : !strcmp(path,"persona.vmdl") ? personaResource.data() :
-        !strcmp(path,"dragon.vmdl") ? dragonResource.data() : wearableResource.data();
+        !strcmp(path,"dragon.vmdl") ? dragonResource.data() : !strcmp(path,"classic_dragon.vmdl") ? classicDragonResource.data() : wearableResource.data();
 }
 // The outfit's entity_model replacements (e.g. a persona's dragon form).
 static const char* dragonPath = "dragon.vmdl";
@@ -130,14 +132,74 @@ static void* __fastcall ResourceFind(void*, appearance::ResourceName* name, bool
     ++handleFinds; return registeredModels.count(NamePath(name)) ? ResourceFor(NamePath(name)) : nullptr;
 }
 static void __fastcall ReleaseModel(void*, void*) {}
-static const char* __fastcall KvModel(void*, const char*) { return "default.vmdl"; }
+static const char* kvModelName = "default.vmdl";
+static const char* __fastcall KvModel(void*, const char*) { return kvModelName; }
 static void __fastcall SetBaseModel(void*, void* model) { combinedBase = model; }
 static bool __fastcall ModelReady(void*) { return ready; }
 static const char* __fastcall ViewModel(void*, int32_t) { return "wearable.vmdl"; }
 
+// Static game data stand-ins. The legacy scenarios model a hero newer than the
+// generated table, so its classic model is observed rather than looked up.
+static const char* tableClassic = nullptr;
+static const char* ClassicFor(uint32_t) { return tableClassic; }
+// Off for the legacy scenarios: there the persona's dragon has no known original.
+static bool formOriginals = false;
+static const char* OriginalFor(const char* replacement) {
+    return formOriginals && replacement && !strcmp(replacement, "dragon.vmdl") ? "classic_dragon.vmdl" : nullptr;
+}
+static bool AlternateFor(const char* model) { return model && !strcmp(model, "dragon.vmdl"); }
+
+// A miniature animation system: models list sequences, each with an activity
+// list whose entry 0 is the activity and whose other entries are modifiers.
+// The table lookups mirror the engine's: variant n of an activity, clamped.
+struct FakeSequence { void** vtable; int32_t activity; std::vector<const char*> modifiers; };
+struct FakeModel { std::vector<FakeSequence> sequences; };
+static const char* ActivityNameOf(int32_t activity) {
+    switch (activity) {
+    case 1500: return "ACT_DOTA_IDLE"; case 1502: return "ACT_DOTA_RUN"; case 1503: return "ACT_DOTA_ATTACK";
+    case 1510: return "ACT_DOTA_CAST_ABILITY_1"; default: return "ACT_INVALID";
+    }
+}
+static int32_t __fastcall SequenceEntries(FakeSequence* s) { return 1 + int32_t(s->modifiers.size()); }
+static const char* __fastcall SequenceEntryName(FakeSequence* s, int32_t i) {
+    return i == 0 ? ActivityNameOf(s->activity) : i <= int32_t(s->modifiers.size()) ? s->modifiers[i - 1] : "";
+}
+// The item table and the client's symbol table, as the scenarios need them.
+static std::vector<appearance::catalog::ItemActivity> fakeActivities;
+static const appearance::catalog::ItemActivity* __cdecl ActivitiesFor(uint32_t definition, size_t& count) {
+    count = 0;
+    for (const auto& entry : fakeActivities) if (entry.definition == definition) ++count;
+    return count ? &*std::find_if(fakeActivities.begin(), fakeActivities.end(), [&](const auto& e) { return e.definition == definition; }) : nullptr;
+}
+static const char* symbolNames[] = {"radiant", "fast", "injured"};
+static const char* __fastcall SymbolName(void*, const uint16_t* symbol) { return *symbol < 3 ? symbolNames[*symbol] : nullptr; }
+static int32_t __fastcall SequenceEntryActivity(FakeSequence* s, int32_t i) { return i == 0 ? s->activity : -1; }
+static void* sequenceVtable[64]{};
+static FakeModel classicAnimations, personaAnimations;
+static void* __fastcall ActivityMapOf(void* model) { return model; }
+static int32_t* __fastcall ActivityVariant(void* map, int32_t* out, int32_t variant, int32_t activity) {
+    std::vector<int32_t> list;
+    const auto& model = *static_cast<FakeModel*>(map);
+    for (size_t i = 0; i < model.sequences.size(); ++i) if (model.sequences[i].activity == activity) list.push_back(int32_t(i));
+    *out = list.empty() ? 0 : list[size_t(std::clamp(variant, 0, int32_t(list.size()) - 1))];
+    return out;
+}
+static void* __fastcall SequenceOf(void* model, int32_t sequence) {
+    auto& sequences = static_cast<FakeModel*>(model)->sequences;
+    return sequence >= 0 && size_t(sequence) < sequences.size() ? &sequences[size_t(sequence)] : nullptr;
+}
+static void* entityAnimations = nullptr;
+static void* __fastcall EntityAnimations(void*) { return entityAnimations; }
+static int32_t seenVariant = -100; static unsigned networkCalls = 0;
+static void __fastcall NetworkActivity(void* npc, bool) {
+    ++networkCalls;
+    seenVariant = *reinterpret_cast<int32_t*>(uintptr_t(npc) + appearance::profile::NetworkSequenceField);
+}
+
 int main() {
     using namespace appearance;
     try {
+        classicModel = ClassicFor; originalModel = OriginalFor; alternateForm = AlternateFor; itemActivities = ActivitiesFor;
         Scheduler burst;
         Check(burst.Observe(1, 11, 1000) && !burst.Begin(1074), "Leave time for the delivered GC reply to be processed");
         Check(burst.Observe(1, 12, 1070) && !burst.Begin(1144) && burst.Begin(1145), "Rapid equipment changes coalesce to the latest outfit");
@@ -498,6 +560,137 @@ int main() {
             Check(currentModel == personaResource.data() && !strcmp(baselineModel.data(), "default.vmdl"),
                 "A new entity with an error model reuses that hero's original baseline");
         }
+
+        // The Dragon Knight session in the field log: the baseline was learned as
+        // the dragon, so the classic model returning after Elder Dragon Form was
+        // taken for a transformation and left on screen for minutes.
+        const auto heroNow = *reinterpret_cast<uint32_t*>(hero.data() + profile::HeroId);
+        const auto entityNow = EntityKey(hero.data(), *reinterpret_cast<uint32_t*>(identities.data() + 5 * 0x70 + 0x10));
+        baselineModel.fill(0); baselineEntity = 0; heroBaselines[heroNow].clear();
+        tableClassic = nullptr; kvModelName = "dragon.vmdl"; currentModel = dragonResource.data();
+        CaptureSpawnModel(hero.data(), reinterpret_cast<void*>(1));
+        Check(!baselineModel[0] && heroBaselines[heroNow].empty(),
+            "Without game data, an alternate form seen at spawn is never recorded as the classic model");
+        tableClassic = "default.vmdl";
+        CaptureSpawnModel(hero.data(), reinterpret_cast<void*>(1));
+        Check(!strcmp(baselineModel.data(), "default.vmdl") && baselineEntity == entityNow && heroBaselines[heroNow] == "default.vmdl",
+            "The game data's classic model wins over whatever the spawn reports");
+        baselineModel.fill(0); baselineEntity = 0;
+        Check(CaptureBaseline(hero.data(), entityNow) && !strcmp(baselineModel.data(), "default.vmdl"),
+            "A later capture with the dragon drawn still restores the game data's classic model");
+        kvModelName = "default.vmdl"; currentModel = personaResource.data();
+        scheduler.Healthy(1); scheduler.Healthy(1 + Scheduler::HealthyMs);
+        auto beforeForm = createdCalls;
+        currentModel = dragonResource.data(); verifyAt = 0; checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+        Check(createdCalls == beforeForm && currentModel == dragonResource.data(), "The dragon form is left to the engine");
+        currentModel = defaultResource.data(); checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+        Check(createdCalls == beforeForm + 1 && currentModel == personaResource.data(),
+            "The classic model coming back after the form restores the outfit at the next check");
+
+        // Animation translation. The server picks variant n of an activity in the
+        // classic model; the replacement lists that activity's sequences differently.
+        constexpr int32_t Idle = 1500, Run = 1502, Attack = 1503, Cast = 1510;
+        sequenceVtable[profile::ActivityCountSlot] = reinterpret_cast<void*>(SequenceEntries);
+        sequenceVtable[profile::ActivityNameSlot] = reinterpret_cast<void*>(SequenceEntryName);
+        sequenceVtable[profile::ActivityIdSlot] = reinterpret_cast<void*>(SequenceEntryActivity);
+        auto seq = [](int32_t activity, std::vector<const char*> modifiers) { return FakeSequence{sequenceVtable, activity, std::move(modifiers)}; };
+        classicAnimations.sequences = {seq(0, {}), seq(Run, {}), seq(Run, {"haste"}), seq(Idle, {}), seq(Run, {"attacking_run"}),
+                                       seq(Attack, {}), seq(Cast, {})};
+        personaAnimations.sequences = {seq(0, {}), seq(Idle, {}), seq(Run, {"arcana_whip"}), seq(Run, {"attacking_run"}), seq(Run, {}),
+                                       seq(Run, {"HASTE"}), seq(Run, {"injured"}), seq(Attack, {}), seq(Attack, {})};
+        *reinterpret_cast<void**>(defaultResource.data()) = &classicAnimations;   // the classic handle's model data
+        entityAnimations = &personaAnimations;
+        engine.entityModel = EntityAnimations; engine.activityMap = ActivityMapOf;
+        engine.activitySequence = ActivityVariant; engine.sequenceDesc = SequenceOf;
+        originalNetworkActivity = NetworkActivity;
+        auto& activityField = *reinterpret_cast<int32_t*>(hero.data() + profile::NetworkActivityField);
+        auto& variantField = *reinterpret_cast<int32_t*>(hero.data() + profile::NetworkSequenceField);
+        auto play = [&](void* npc, int32_t activity, int32_t variant) {
+            *reinterpret_cast<int32_t*>(static_cast<uint8_t*>(npc) + profile::NetworkActivityField) = activity;
+            *reinterpret_cast<int32_t*>(static_cast<uint8_t*>(npc) + profile::NetworkSequenceField) = variant;
+            OnNetworkActivity(npc, false); return seenVariant;
+        };
+        Check(play(hero.data(), Run, 0) == 2 && variantField == 0 && activityField == Run,
+            "A plain run plays the replacement's plain run, and the networked variant is restored after Dota resolves it");
+        Check(play(hero.data(), Run, 1) == 3, "A modifier the server chose (haste) selects the replacement's sequence with it, ignoring case");
+        Check(play(hero.data(), Run, 2) == 1, "Running while attacking keeps its modifier on the replacement");
+        Check(play(hero.data(), Run, 9) == 1, "A variant past the end clamps to the last one, as the engine does");
+        Check(play(hero.data(), Attack, 0) == 0 && play(hero.data(), Attack, 1) == 1,
+            "Equally good replacement sequences keep the variety of the server's own random pick");
+        Check(play(hero.data(), Cast, 3) == 3, "An activity the replacement lacks is left to the engine untouched");
+        Check(NativeStatus().animationsTranslated == 4 && NativeStatus().animationsSeen == 7 &&
+            !strcmp(NativeStatus().lastAnimation, "activité 1502 : variante 9 -> 1"),
+            "Translations are counted for the HUD and the log");
+        Check(play(hero.data(), Run, 1) == 3 && originPaths.size() == 1, "The classic model is acquired once, not per animation");
+        currentModel = errorResource.data();
+        Check(play(hero.data(), Run, 1) == 1, "A model that is not the outfit (hex, error) is animated natively");
+        currentModel = dragonResource.data();
+        Check(play(hero.data(), Run, 1) == 1, "An alternate form whose original model is unknown is animated natively");
+        currentModel = personaResource.data();
+        Check(play(otherHero.data(), Run, 1) == 1 && play(hero.data(), Run, 1) == 3, "Other heroes are never translated");
+        const auto callsBeforeCommit = networkCalls;
+        next = std::make_shared<Snapshot>(*next); ++next->revision; ++next->selections[0].style; ++wanted.style; Publish(next);
+        OnThink(hero.data()); Settle(hero.data());
+        Check(rendered.style == wanted.style && networkCalls == callsBeforeCommit + 1 && seenVariant == 3,
+            "A commit re-resolves the playing animation against the new model at once");
+
+        // Elder Dragon Form under a persona: the server draws its classic dragon,
+        // and the outfit holds the persona's own dragon for exactly that model.
+        formOriginals = true;
+        *reinterpret_cast<void**>(dragonResource.data()) = &personaAnimations;   // a loaded handle has model data
+        scheduler.Healthy(1); scheduler.Healthy(1 + Scheduler::HealthyMs);
+        const auto beforeDragon = createdCalls; const auto resyncsBeforeDragon = NativeStatus().resyncs;
+        currentModel = classicDragonResource.data(); verifyAt = 0; checkAt = 1; OnThink(hero.data());
+        Check(modelName == "dragon.vmdl" && currentModel == dragonResource.data() && createdCalls == beforeDragon && NativeStatus().forms == 1,
+            "The persona's own dragon replaces the server's classic dragon, without rebuilding the outfit");
+        checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+        Check(NativeStatus().forms == 1 && createdCalls == beforeDragon && NativeStatus().resyncs == resyncsBeforeDragon,
+            "The drawn alternate form is stable: no second swap and no rebuild");
+        currentModel = defaultResource.data(); checkAt = 1; OnThink(hero.data()); Settle(hero.data());
+        Check(createdCalls == beforeDragon + 1 && currentModel == personaResource.data(),
+            "Leaving the form, the server's classic human is replaced by the persona again");
+        formOriginals = false;
+        *reinterpret_cast<void**>(dragonResource.data()) = nullptr;
+
+        // Item animation modifiers: the server never hears of the outfit's items,
+        // so it never asks for the sequences they unlock.
+        next = std::make_shared<Snapshot>(*next); ++next->revision; ++next->selections[0].style; ++wanted.style;
+        fakeActivities = {{wanted.definition, -1, "ACT_DOTA_RUN", "pegleg"},
+                          {wanted.definition, int32_t(wanted.style) + 1, "ALL", "spear"}};
+        Publish(next); OnThink(hero.data()); Settle(hero.data());
+        Check(rendered.style == wanted.style && outfitActivities.size() == 1 && !strcmp(outfitActivities[0]->modifier, "pegleg"),
+            "A commit keeps the item modifiers of the equipped style only");
+        personaAnimations.sequences.push_back(seq(Run, {"pegleg"}));   // run variant 5
+        personaAnimations.sequences.push_back(seq(Attack, {"fast"}));  // attack variant 2
+        Check(play(hero.data(), Run, 0) == 5, "The outfit's item modifier selects its own run on the replacement model");
+        Check(play(hero.data(), Attack, 1) == 1, "An item modifier for another activity changes nothing there");
+        // The client's own list: the classic model has no fast attack to pick.
+        engine.symbolString = SymbolName;
+        const uint16_t clientSymbols[] = {1, 0};   // "fast", "radiant"
+        *reinterpret_cast<int32_t*>(hero.data() + profile::ActivityModifiersCount) = 2;
+        *reinterpret_cast<const uint16_t**>(hero.data() + profile::ActivityModifiersData) = clientSymbols;
+        Check(play(hero.data(), Attack, 0) == 2, "The client's attack-speed modifier picks the replacement's fast attack");
+        *reinterpret_cast<int32_t*>(hero.data() + profile::ActivityModifiersCount) = 0;
+        Check(play(hero.data(), Attack, 0) == 0, "Without it the plain attack stays");
+        // Plain items on the classic model: only what the items add can change the pick.
+        noReplacement = true; entityAnimations = &classicAnimations;
+        classicAnimations.sequences.push_back(seq(Run, {"pegleg"}));   // classic run variant 3
+        next = std::make_shared<Snapshot>(*next); ++next->revision; ++next->selections[0].style; ++wanted.style; Publish(next);
+        fakeActivities[1].style = int32_t(wanted.style) + 1;   // still a style that is not equipped
+        OnThink(hero.data()); Settle(hero.data());
+        Check(modelName == "default.vmdl" && currentModel == defaultResource.data() && outfitActivities.size() == 1,
+            "Fixture: an outfit of plain items keeps the classic model");
+        Check(play(hero.data(), Run, 0) == 3, "A peg leg's run plays on the classic model the server animates");
+        Check(play(hero.data(), Run, 1) == 1, "The server's own pick stands when it is already among the best (haste)");
+        Check(play(hero.data(), Attack, 0) == 0, "An activity the items do not touch is left to the server");
+        noReplacement = false; entityAnimations = &personaAnimations; fakeActivities.clear();
+        next = std::make_shared<Snapshot>(*next); ++next->revision; next->selections[0] = {heroNow, 0, 0, 0, 0}; Publish(next);
+        OnThink(hero.data()); Settle(hero.data());
+        Check(modelName == "default.vmdl" && play(hero.data(), Run, 1) == 1, "The classic outfit needs no translation");
+        originalNetworkActivity = nullptr;
+        ReleaseOrigins();
+        Check(originPaths.empty() && originModels.empty(), "Origin model references are released with the outfit");
+        *reinterpret_cast<void**>(defaultResource.data()) = nullptr;
 
         ReleaseModels(committedModels);
         Check(*reinterpret_cast<LONG*>(wearableResource.data()+0x20) == 0 && *reinterpret_cast<LONG*>(personaResource.data()+0x20) == 0 &&

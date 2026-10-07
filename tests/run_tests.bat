@@ -34,4 +34,18 @@ if errorlevel 1 exit /b 1
 build\resolver_against_client.exe -blank-hints
 if errorlevel 1 exit /b 1
 python tests\test_inventory_cache_repair.py
+if errorlevel 1 exit /b 1
+if not exist build\obj\tools mkdir build\obj\tools
+cl /nologo /O2 /EHsc /W4 /std:c++17 /utf-8 /DUNICODE /D_UNICODE /Fobuild\obj\tools\ /Isrc src\tools.cpp /link /OUT:build\wardrobe_tools.exe
+if errorlevel 1 exit /b 1
+REM The verdict the application shows on its home screen, for the installed Dota.
+build\wardrobe_tools.exe compat
+if errorlevel 1 exit /b 1
+python tests\test_wardrobe_tools.py
+if errorlevel 1 exit /b 1
+REM The catalog built without Python must stay identical to update_db.py's.
+python tests\test_catalog_builder.py
+if errorlevel 1 exit /b 1
+REM The one-click installer, in scratch folders (skipped until package.py has run).
+python tests\test_installer.py
 exit /b %ERRORLEVEL%

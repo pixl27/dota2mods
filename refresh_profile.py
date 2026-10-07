@@ -52,11 +52,16 @@ FUNCTIONS = ["BuildWearableList", "ModelOverride", "CombineModels", "Spawn", "Th
              "InventoryForPlayer", "EquippedView", "DefaultView", "FindItemView", "KeyValuesModel", "SetModel", "CreateWearables",
              "SetBaseModel", "ModelHandle", "ModelReady", "ViewModel", "ResourceNameCtor", "ResourceNameIsType", "EntityModelLookup",
              "EntityModelModifiers", "KeyValuesCtor", "PrepareWearables", "KeyValuesDtor", "ModifierManager", "PreviewBuilder",
-             "ModifierCtor", "PopulateModifiers", "Allocate", "LocalControllerGetter", "ModelNameLookup", "DestroyWearables"]
-GLOBALS = ["LocalController", "EntityChunks", "InventoryManager", "ModelInfo", "ResourceSystem", "ResourceSystemInterface", "JustInTimeManifest"]
+             "ModifierCtor", "PopulateModifiers", "Allocate", "LocalControllerGetter", "ModelNameLookup", "DestroyWearables",
+             "NetworkActivity", "EntityModel", "ActivityMap", "ActivitySequence", "ActivityBuild", "SequenceDesc",
+             "SelectFromModifiers", "UpdateActivityModifiers", "AddActivityModifier", "ModifierSymbol"]
+GLOBALS = ["LocalController", "EntityChunks", "InventoryManager", "ModelInfo", "ResourceSystem", "ResourceSystemInterface", "JustInTimeManifest",
+           "ModifierSymbols"]
 OFFSETS = ["SteamId", "AssignedHero", "PlayerId", "HeroId", "DirtyFlags", "BaseModel", "ModelIndex", "Modifiers", "CreationList",
-           "CreationInitialized", "WearableCount", "ModifierPath", "ModelRefCount"]
-SLOTS = ["ResourceStateSlot", "ResourceRegisterSlot", "ResourceFindSlot", "FindOrLoadSlot", "ReleaseSlot", "ModelNameSlot"]
+           "CreationInitialized", "WearableCount", "ModifierPath", "ModelRefCount", "NetworkActivityField", "NetworkSequenceField",
+           "ActivityModifiersCount", "ActivityModifiersData"]
+SLOTS = ["ResourceStateSlot", "ResourceRegisterSlot", "ResourceFindSlot", "FindOrLoadSlot", "ReleaseSlot", "ModelNameSlot",
+         "ActivityCountSlot", "ActivityNameSlot", "ActivityIdSlot"]
 OFFSETS.append("ModifierStorage")
 GLOBALS.append("MemAllocImport")
 
@@ -197,6 +202,10 @@ def masked_bytes(image, rva, length):
         if ins.imm_size == 4 and ins.imm_offset:
             keep[ins.imm_offset:ins.imm_offset + 4] = b"\0" * 4
         if (ins.mnemonic in ("call", "jmp") or ins.mnemonic.startswith("j")) and ins.imm_size:
+            keep[ins.imm_offset:ins.imm_offset + ins.imm_size] = b"\0" * ins.imm_size
+        # The stack frame size changes whenever a local is added or removed: the
+        # 2026-10-07 update turned DestroyWearables' "sub rsp, 0x50" into 0x40.
+        if ins.mnemonic in ("sub", "add") and ins.op_str.startswith("rsp, ") and ins.imm_size:
             keep[ins.imm_offset:ins.imm_offset + ins.imm_size] = b"\0" * ins.imm_size
         pattern += raw
         mask += keep
@@ -418,7 +427,71 @@ class Locator:
         L("LocalControllerGetter", lambda: self.via_call("LocalControllerGetter", "Spawn", lambda i, c: text_of(c[i - 1]) == "xor ecx, ecx"))
         # Only needed for the model-name vtable slot, which is otherwise a guess.
         L("ModelNameLookup", lambda: self.string_function("particles/world_destruction_fx/tree_destroy.vpcf", "tree_destruction_generic"))
-        L("DestroyWearables", None)
+        def destroy_wearables():
+            # No string and no located caller reaches it. Its shape does: it reads the
+            # wearable count (movsxd rax, [rcx+disp32]) at once, then walks entity
+            # handles (& 0x7fff, 0x70-byte identities). Unique in every build seen.
+            found = []
+            name, va, vs, po, ps = im.text
+            for f in im.starts:
+                if not va <= f < va + vs:
+                    continue
+                head = im.read(f, 0x30)
+                at = head.find(b"\x48\x63\x81")
+                if at < 0 or at > 0x20 or not 0x800 <= int.from_bytes(head[at + 3:at + 7], "little") <= 0x1000:
+                    continue
+                code = im.disasm(f)
+                if len(code) > 400:
+                    continue
+                text = [text_of(x) for x in code]
+                if any("0x7fff" in t for t in text) and any(t.startswith("imul") and t.endswith(", 0x70") for t in text):
+                    found.append(f)
+            return found[0] if len(found) == 1 else None
+        L("DestroyWearables", destroy_wearables)
+
+        # Animation. C_DOTA_BaseNPC networks an activity and a variant index into
+        # that activity's list of sequences in the server's model; the function
+        # that turns the pair into a sequence is the only one naming this string.
+        L("NetworkActivity", lambda: self.string_function("OnDataChanged"))
+
+        def network_call(name, previous):
+            after = 0
+            if previous:
+                after = self.find_call("NetworkActivity", lambda i, c: direct_call_target(c[i]) == self.found[previous])[1] + 1
+            return self.via_call(name, "NetworkActivity", lambda i, c: True, after=after)
+        L("EntityModel", lambda: network_call("EntityModel", None))
+        L("ActivityMap", lambda: network_call("ActivityMap", "EntityModel"))
+        L("ActivitySequence", lambda: network_call("ActivitySequence", "ActivityMap"))
+
+        def activity_build():
+            # The lazily built per-model table is filled by the last call.
+            code = self.body("ActivityMap")
+            last = [i for i, x in enumerate(code) if direct_call_target(x) is not None][-1]
+            self.callsite["ActivityBuild"] = ("ActivityMap", code[last].address)
+            return direct_call_target(code[last])
+        L("ActivityBuild", activity_build)
+        L("SequenceDesc", lambda: self.via_call("SequenceDesc", "ActivityBuild", lambda i, c: text_of(c[i - 1]) == "mov edx, eax"))
+
+        def select_from_modifiers():
+            # The engine's own modifier match: the caller of SequenceDesc that hashes
+            # an activity and reads both the entry count and the entry names.
+            matches = set()
+            for f in {im.function_start(site) for site in im.callers(self.found["SequenceDesc"])}:
+                code = im.disasm(f)
+                text = [text_of(x) for x in code]
+                if (any("0x5bd1e995" in t for t in text) and any(t.startswith("call qword ptr [rdx + ") for t in text)
+                        and any(t.startswith("call qword ptr [rax + ") and any(text_of(y) == "lea edx, [r14 + 1]" for y in code[max(0, k - 4):k])
+                                for k, t in enumerate(text))):
+                    matches.add(f)
+            return matches.pop() if len(matches) == 1 else None
+        L("SelectFromModifiers", select_from_modifiers)
+        # The client keeps its own list of the hero's activity modifiers (attack and
+        # movement speed, health, team, buffs...), rebuilt here; entries are symbols.
+        L("UpdateActivityModifiers", lambda: self.string_function("item_style_%d"))
+        illusion = set(im.find_string("illusion"))
+        L("AddActivityModifier", lambda: self.via_call("AddActivityModifier", "UpdateActivityModifiers",
+                                                       lambda i, c: any(x.mnemonic == "lea" and rip_target(x) in illusion for x in c[max(0, i - 4):i])))
+        L("ModifierSymbol", lambda: self.via_call("ModifierSymbol", "AddActivityModifier", lambda i, c: True))
         return self.found
 
     # ----------------------------------------------------------------- sites
@@ -578,6 +651,19 @@ class Locator:
                                 and any(rip_target(x) == self.image_value("ModelInfo") for x in c[max(0, i - 10):i]), "Slot")
         # The modifier list is heap allocated, so this size has to be the engine's own.
         out["ModifierStorage"] = S("ModifierStorage", "PreviewBuilder", lambda i, c: text_of(c[i]) == "mov ecx, 0x30", "Imm")
+        # C_DOTA_BaseNPC::m_NetworkActivity and m_NetworkSequenceIndex, as the resolver reads them.
+        out["NetworkActivityField"] = S("NetworkActivityField", "NetworkActivity", lambda i, c: text_of(c[i]).startswith("mov ebx, dword ptr [rcx + "), "Disp")
+        out["NetworkSequenceField"] = S("NetworkSequenceField", "NetworkActivity", lambda i, c: text_of(c[i]).startswith("mov edi, dword ptr [r15 + "), "Disp")
+        # ISequence lives in animationsystem.dll; client.dll's own calls pin the slots.
+        out["ActivityCountSlot"] = S("ActivityCountSlot", "SelectFromModifiers", lambda i, c: text_of(c[i]).startswith("call qword ptr [rdx + "), "Slot")
+        out["ActivityNameSlot"] = S("ActivityNameSlot", "SelectFromModifiers", lambda i, c: text_of(c[i]).startswith("call qword ptr [rax + ")
+                                    and any(text_of(x) == "lea edx, [r14 + 1]" for x in c[max(0, i - 4):i]), "Slot")
+        out["ActivityIdSlot"] = S("ActivityIdSlot", "ActivityBuild", lambda i, c: text_of(c[i]).startswith("call qword ptr [rax + ")
+                                  and text_of(c[i - 1]) == "mov rcx, rsi" and text_of(c[i + 1]) == "test eax, eax", "Slot")
+        # C_DOTA_BaseNPC::m_ActivityModifiers: a count, then the symbol storage.
+        out["ActivityModifiersCount"] = S("ActivityModifiersCount", "AddActivityModifier", lambda i, c: c[i].mnemonic == "movsxd" and mem_disp(c[i], "rdi"), "Disp")
+        out["ActivityModifiersData"] = S("ActivityModifiersData", "AddActivityModifier", lambda i, c: text_of(c[i]).startswith("mov rcx, qword ptr [rdi + "), "Disp")
+        out["ModifierSymbols"] = S("ModifierSymbols", "ModifierSymbol", lambda i, c: text_of(c[i]).startswith("lea rcx, [rip"), "Rip")
         out["SteamId"] = self.schema_site("SteamId", "m_steamID")
         out["AssignedHero"] = self.schema_site("AssignedHero", "m_hAssignedHero")
         return out
@@ -671,7 +757,10 @@ def main(argv=None):
     print(f"[*] Lecture de {client}")
     image = Image(client)
     print(f"[*] {client}: sha256 {image.sha256[:16]}..., timestamp {image.pe.FILE_HEADER.TimeDateStamp:#x}")
-    if previous.get("sha256") == image.sha256 and not args.seed:
+    # Entries added to this script since the profile was written still have to be located.
+    complete = all(n in previous.get("functions", {}) for n in FUNCTIONS) and \
+        all(n in previous.get("values", {}) for n in GLOBALS + OFFSETS + SLOTS)
+    if previous.get("sha256") == image.sha256 and complete and not args.seed:
         print("[OK] client.dll already matches the profile")
         return 0
     locator = Locator(image, previous)

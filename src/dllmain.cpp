@@ -79,6 +79,9 @@ static void RenderInGame() {
             native.hero, native.matched, native.expected, (unsigned long long)native.rebuilds);
         ImGui::TextDisabled("Modèles: %u enregistrés | %u connus | %u indisponibles | resync: %u",
             native.registered, native.known, native.unavailable, native.resyncs);
+        if (native.animationsSeen)
+            ImGui::TextDisabled("Animations: %u traduites sur %u | %s",
+                native.animationsTranslated, native.animationsSeen, native.lastAnimation);
         if (native.renderModel[0]) {
             const bool broken = strstr(native.renderModel, "error") != nullptr;
             ImGui::TextColored(broken ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.6f, 0.9f, 0.6f, 1), "Modèle rendu: %s", native.renderModel);
