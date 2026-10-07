@@ -43,5 +43,5 @@ Direction: a dark, deep, quiet surface with one luminous accent; depth from ligh
 - [x] Auto-update: src/app/update.h (GitHub latest release, WinHTTP), installer --update; clicked for real against a local fake release: downloaded, installed without a click, reopened
 - [x] release.py: version, build, tests, package, and (only with --publish) GitHub release + asset; dry run OK in 56 s
 - [x] User's own install (%LOCALAPPDATA%\Programs\Wardrobe) replaced by 2026.10.07.1 (new catalog, 0 missing)
-- [ ] First public release: needs the user's go (commit + push, then `python release.py --keep-version --publish`)
+- [x] First public release v2026.10.07.1 published (https://github.com/pixl27/dota2mods/releases/tag/v2026.10.07.1); public download identical to the tested installer; update check and redirect download verified against the real GitHub
 - [ ] Friend: one manual install from the release page (earlier installers have no updater); automatic afterwards
