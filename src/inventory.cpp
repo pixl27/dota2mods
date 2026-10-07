@@ -336,7 +336,11 @@ bool Setup() {
         SetPhase(InventoryPhase::Failed, "Steam callback exports unavailable; local equip cannot notify Dota"); return false;
     }
 
-    LoadDB("data/skins_full.json");
+    // The loader copies Wardrobe's own catalog here right before every
+    // injection. Relative paths resolve against Dota's working directory
+    // (game\bin\win64), where an early version left a catalog from 2026-09-08:
+    // read first, it hid every cosmetic released since.
+    LoadDB("C:\\Temp\\opencode\\skins_full.json");
     std::vector<uint32_t> definitions;
     { std::lock_guard<std::mutex> lock(g_DbMutex);
       std::set<uint32_t> seen;
@@ -435,8 +439,9 @@ void LoadDB(const std::string& path) {
                     e.value("slot", "misc"), e.value("rarity", "common"), e.value("prefab", "") });
             }
             if (entries.empty()) continue;
+            const size_t count = entries.size();
             { std::lock_guard<std::mutex> lock(g_DbMutex); g_DB = std::move(entries); }
-            Log("Loaded skin database: %s", candidate); return;
+            Log("Loaded skin database: %s (%zu entries)", candidate, count); return;
         } catch (const std::exception& error) { Log("Cannot read %s: %s", candidate, error.what()); }
     }
 }
