@@ -57,9 +57,13 @@ def run(step, command):
         sys.exit(result.returncode)
 
 
-def token():
-    """The credential Git Credential Manager holds for github.com, in memory only."""
-    answer = subprocess.run(["git", "credential", "fill"], input="protocol=https\nhost=github.com\n\n",
+def token(owner):
+    """The credential Git Credential Manager holds for the owner's GitHub account, in memory only.
+
+    Asked by account name: the manager can also hold restricted tokens (user
+    "x-access-token") that push but cannot create releases, and without a name
+    it may hand one of those out first."""
+    answer = subprocess.run(["git", "credential", "fill"], input=f"protocol=https\nhost=github.com\nusername={owner}\n\n",
                             capture_output=True, text=True, cwd=HERE)
     for line in answer.stdout.splitlines():
         if line.startswith("password="):
@@ -130,7 +134,7 @@ def main(argv=None):
         print(f"    Rien n'est publié. Pour le mettre en ligne : python release.py --keep-version --publish")
         return 0
 
-    secret = token()
+    secret = token(repository.split("/")[0])
     if not secret:
         print("[!] Aucun identifiant GitHub dans Git : fais un git push une fois pour te connecter, puis réessaie.")
         return 1
