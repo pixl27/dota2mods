@@ -75,8 +75,14 @@ def api(method, url, secret, body=None, data=None, content_type="application/jso
     request.add_header("User-Agent", "wardrobe-release")
     if body is not None or data is not None:
         request.add_header("Content-Type", content_type)
-    with urllib.request.urlopen(request, timeout=120) as response:
-        return json.loads(response.read() or b"{}")
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        # GitHub explains its refusals in the body; keep that, drop the traceback.
+        detail = error.read().decode("utf-8", "replace")[:500]
+        error.detail = detail
+        raise
 
 
 def published_state():
@@ -97,6 +103,7 @@ def main(argv=None):
     parser.add_argument("--publish", action="store_true", help="create the GitHub release and upload the installer")
     parser.add_argument("--allow-unpushed", action="store_true", help="publish even if the code is not committed and pushed")
     parser.add_argument("--notes", default="", help="what changed, shown on the release page")
+    parser.add_argument("--skip-build", action="store_true", help="publish the installer already built for this version")
     args = parser.parse_args(argv)
 
     previous, repository = current()
@@ -110,9 +117,10 @@ def main(argv=None):
     if version != previous:
         write_version(version)
     print(f"[*] Version {version} ({repository})")
-    run("Compilation", ["cmd", "/c", str(HERE / "build.bat"), "--no-pause"])
-    run("Tests", ["cmd", "/c", str(HERE / "tests" / "run_tests.bat")])
-    run("Paquet et installateur", [sys.executable, str(HERE / "package.py")])
+    if not args.skip_build:
+        run("Compilation", ["cmd", "/c", str(HERE / "build.bat"), "--no-pause"])
+        run("Tests", ["cmd", "/c", str(HERE / "tests" / "run_tests.bat")])
+        run("Paquet et installateur", [sys.executable, str(HERE / "package.py")])
     installer = HERE / "build" / f"Wardrobe-Setup-{version}.exe"
     if not installer.exists():
         print(f"[!] {installer} est introuvable.")
@@ -141,10 +149,16 @@ def main(argv=None):
             "**Mettre à jour** : Wardrobe propose la nouvelle version tout seul sur son écran d'accueil.\n\n"
             "Windows peut afficher « Windows a protégé votre ordinateur » (programme non signé) : "
             "« Informations complémentaires » puis « Exécuter quand même ».")
-    release = api("POST", f"{base}/releases", secret, {"tag_name": tag, "name": f"Wardrobe {version}", "body": body,
-                                                        "draft": False, "prerelease": False})
-    upload = release["upload_url"].split("{")[0] + f"?name={installer.name}"
-    asset = api("POST", upload, secret, data=installer.read_bytes(), content_type="application/octet-stream")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=HERE).stdout.strip()
+    try:
+        release = api("POST", f"{base}/releases", secret, {"tag_name": tag, "target_commitish": head, "name": f"Wardrobe {version}",
+                                                            "body": body, "draft": False, "prerelease": False})
+        upload = release["upload_url"].split("{")[0] + f"?name={installer.name}"
+        asset = api("POST", upload, secret, data=installer.read_bytes(), content_type="application/octet-stream")
+    except urllib.error.HTTPError as error:
+        print(f"[!] GitHub a refusé ({error.code}) : {getattr(error, 'detail', '')}")
+        print("    Vérifie sur la page des releases si quelque chose a été créé avant de relancer.")
+        return 1
     print(f"[OK] Publié : {release['html_url']}")
     print(f"     {asset['browser_download_url']}")
     print("     Les copies installées le proposeront à la prochaine vérification (au lancement, puis toutes les six heures).")
