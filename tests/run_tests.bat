@@ -9,6 +9,14 @@ if not defined GC_VS_PATH exit /b 1
 call "%GC_VS_PATH%\VC\Auxiliary\Build\vcvars64.bat" >nul
 :compile
 if not exist build mkdir build
+cl /nologo /EHsc /W4 /std:c++17 /utf-8 /Isrc tests\release_test.cpp /Fo:build\release_test.obj /Fe:build\release_test.exe
+if errorlevel 1 exit /b 1
+build\release_test.exe
+if errorlevel 1 exit /b 1
+cl /nologo /EHsc /W4 /std:c++17 /utf-8 /Isrc tests\update_check_test.cpp /Fo:build\update_check_test.obj /Fe:build\update_check_test.exe
+if errorlevel 1 exit /b 1
+python tests\test_update_check.py
+if errorlevel 1 exit /b 1
 cl /nologo /EHsc /W4 /std:c++17 /utf-8 /Isrc tests\gc_protocol_test.cpp /Fo:build\gc_protocol_test.obj /Fe:build\gc_protocol_test.exe
 if errorlevel 1 exit /b 1
 build\gc_protocol_test.exe

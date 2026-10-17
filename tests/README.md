@@ -1,5 +1,12 @@
 # GC receiver regression checks
 
+The launcher update checks also run from `tests\run_tests.bat`.
+`release_test.cpp` validates release JSON, version components and installer
+selection, including malformed responses and releases without a usable asset.
+`test_update_check.py` runs `update_check_test.exe` against a loopback HTTP
+server to verify the actual asynchronous updater's success/failure states.
+It never downloads/runs an installer or contacts GitHub or Dota.
+
 Run `tests\run_tests.bat` from Windows with Visual Studio C++ Build Tools installed.
 The script finds the x64 compiler and builds five standalone test executables.
 It also uses Python for the cache-repair tests.

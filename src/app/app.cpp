@@ -413,6 +413,11 @@ void DrawHome(App& app, const env::Snapshot& state) {
                        downloading ? u8"Téléchargement…" : "Mettre à jour", !downloading, downloading ? release.progress : -1.0f))
                 app.updater.Download();
         }
+        if (release.state == update::State::Failed && release.url.empty()) {
+            Spacer(metric::Gap);
+            Notice("maj-check-error", Mark::Warn, icon::Warning,
+                   "Vérification de mise à jour impossible", release.error.c_str(), nullptr, false);
+        }
         const auto fresh = app.compat.Catalog();
         if (fresh.state == env::FreshState::Outdated && state.catalog.present) {
             Spacer(metric::Gap);

@@ -1,4 +1,5 @@
 #pragma once
+#include "release.h"
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <winhttp.h>
@@ -33,27 +34,6 @@ struct Status {
     float progress = 0;
     fs::path installer;    // downloaded file, once Ready
 };
-
-// "2026.10.07.2" > "2026.10.07.1" > "2026.10.6": numbers compared one by one.
-inline bool Newer(const std::string& candidate, const std::string& current) {
-    auto parts = [](const std::string& text) {
-        std::vector<long> out;
-        long value = 0;
-        bool any = false;
-        for (char c : text) {
-            if (c >= '0' && c <= '9') { value = value * 10 + (c - '0'); any = true; }
-            else if (any) { out.push_back(value); value = 0; any = false; }
-        }
-        if (any) out.push_back(value);
-        return out;
-    };
-    const auto a = parts(candidate), b = parts(current);
-    for (size_t i = 0; i < a.size() || i < b.size(); ++i) {
-        const long x = i < a.size() ? a[i] : 0, y = i < b.size() ? b[i] : 0;
-        if (x != y) return x > y;
-    }
-    return false;
-}
 
 inline std::wstring Wide(const std::string& text) {
     if (text.empty()) return {};
@@ -122,25 +102,6 @@ bool Get(const std::string& url, Sink sink, std::string& error, uint64_t* length
     return ok;
 }
 
-// The two fields needed from GitHub's release JSON, without a JSON library.
-inline std::string JsonField(const std::string& json, const std::string& key, size_t from = 0, size_t* at = nullptr) {
-    const std::string needle = "\"" + key + "\"";
-    size_t p = json.find(needle, from);
-    if (p == std::string::npos) return {};
-    p = json.find(':', p + needle.size());
-    if (p == std::string::npos) return {};
-    const size_t open = json.find('"', p + 1);
-    if (open == std::string::npos) return {};
-    std::string value;
-    size_t i = open + 1;
-    for (; i < json.size() && json[i] != '"'; ++i) {
-        if (json[i] == '\\' && i + 1 < json.size()) ++i;
-        value.push_back(json[i]);
-    }
-    if (at) *at = i;
-    return value;
-}
-
 inline std::string Endpoint() {
     char forced[512]{};   // tests point this at a local fake release
     if (GetEnvironmentVariableA("WARDROBE_TEST_RELEASES", forced, sizeof(forced))) return forced;
@@ -188,19 +149,21 @@ private:
         const bool ok = Get(Endpoint(), [&](const char* data, size_t size) { body.append(data, size); return body.size() < (8u << 20); }, error);
         Status result;
         if (!ok) { result.state = State::Failed; result.error = error; Set(result); return; }
-        const std::string tag = JsonField(body, "tag_name");
-        std::string url;
-        for (size_t at = 0;;) {
-            size_t end = 0;
-            const std::string candidate = JsonField(body, "browser_download_url", at, &end);
-            if (candidate.empty()) break;
-            if (candidate.find("Wardrobe-Setup") != std::string::npos && candidate.size() > 4 &&
-                candidate.compare(candidate.size() - 4, 4, ".exe") == 0) { url = candidate; break; }
-            at = end;
+        const auto release = ParseRelease(body, WARDROBE_VERSION);
+        result.version = release.version;
+        result.url = release.url;
+        switch (release.state) {
+        case ReleaseState::Current: result.state = State::Current; break;
+        case ReleaseState::Available: result.state = State::Available; break;
+        case ReleaseState::MissingInstaller:
+            result.state = State::Failed;
+            result.error = "la nouvelle version ne contient pas d'installateur Wardrobe compatible";
+            break;
+        default:
+            result.state = State::Failed;
+            result.error = "réponse de mise à jour invalide";
+            break;
         }
-        result.version = tag.rfind("v", 0) == 0 ? tag.substr(1) : tag;
-        result.url = url;
-        result.state = !tag.empty() && !url.empty() && Newer(result.version, WARDROBE_VERSION) ? State::Available : State::Current;
         Set(result);
     }
     void Fetch() {
