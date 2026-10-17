@@ -332,11 +332,11 @@ void DrawHome(App& app, const env::Snapshot& state) {
         mark = Mark::Bad; pill = "Mise à jour requise";
         headline = "Dota 2 a changé";
         if (state.projectSources)
-            sprintf_s(incompatibleDetail, "La dernière mise à jour de Dota a modifié ce dont Wardrobe a besoin (%s). "
-                      "Un clic relit le jeu et recompile Wardrobe, en deux minutes environ.", compat.failure.c_str());
+            sprintf_s(incompatibleDetail, language::Tr("La dernière mise à jour de Dota a modifié ce dont Wardrobe a besoin (%s). "
+                      "Un clic relit le jeu et recompile Wardrobe, en deux minutes environ."), compat.failure.c_str());
         else
-            sprintf_s(incompatibleDetail, "Cette version de Wardrobe ne fonctionne pas avec le Dota 2 installé (%s). "
-                      "Demande la nouvelle version à la personne qui te l'a donnée et installe-la : c'est tout.",
+            sprintf_s(incompatibleDetail, language::Tr("Cette version de Wardrobe ne fonctionne pas avec le Dota 2 installé (%s). "
+                      "Demande la nouvelle version à la personne qui te l'a donnée et installe-la : c'est tout."),
                       compat.failure.c_str());
         detail = incompatibleDetail;
     } else if (!state.DotaRunning()) {
@@ -403,11 +403,11 @@ void DrawHome(App& app, const env::Snapshot& state) {
             Spacer(metric::Gap);
             const bool downloading = release.state == update::State::Downloading || release.state == update::State::Ready;
             if (release.state == update::State::Failed)
-                sprintf_s(text, "Le téléchargement de la version %s a échoué (%s). Réessaie dans un instant.", release.version.c_str(), release.error.c_str());
+                sprintf_s(text, language::Tr("Le téléchargement de la version %s a échoué (%s). Réessaie dans un instant."), release.version.c_str(), language::Tr(release.error.c_str()));
             else if (downloading)
-                sprintf_s(text, "Téléchargement de la version %s… Wardrobe se fermera puis se rouvrira tout seul.", release.version.c_str());
+                sprintf_s(text, language::Tr("Téléchargement de la version %s… Wardrobe se fermera puis se rouvrira tout seul."), release.version.c_str());
             else
-                sprintf_s(text, "La version %s est disponible. Un clic la télécharge et l'installe ; Wardrobe redémarre tout seul.",
+                sprintf_s(text, language::Tr("La version %s est disponible. Un clic la télécharge et l'installe ; Wardrobe redémarre tout seul."),
                           release.version.c_str());
             if (Notice("maj-app", Mark::Busy, icon::Download, "Nouvelle version de Wardrobe", text,
                        downloading ? u8"Téléchargement…" : "Mettre à jour", !downloading, downloading ? release.progress : -1.0f))
@@ -418,8 +418,9 @@ void DrawHome(App& app, const env::Snapshot& state) {
             Spacer(metric::Gap);
             std::string names;
             for (size_t i = 0; i < fresh.examples.size(); ++i) names += (i ? ", " : "") + fresh.examples[i];
-            sprintf_s(text, "%zu cosmétique%s de la dernière mise à jour de Dota manque%s au catalogue (dont %s). Un clic les ajoute, en quelques secondes.",
-                      fresh.missing, fresh.missing > 1 ? "s" : "", fresh.missing > 1 ? "nt" : "", names.c_str());
+            sprintf_s(text, language::Tr("%zu cosmétique%s de la dernière mise à jour de Dota manque%s au catalogue (dont %s). Un clic les ajoute, en quelques secondes."),
+                      fresh.missing, language::Current() == language::Language::French && fresh.missing > 1 ? "s" : "",
+                      language::Current() == language::Language::French && fresh.missing > 1 ? "nt" : "", names.c_str());
             const bool possible = !state.layout.Binary(L"wardrobe_tools.exe").empty() && state.DotaInstalled() && !app.runner.Busy();
             if (Notice("maj-catalogue", Mark::Warn, icon::Library, "De nouveaux cosmétiques sont sortis", text, "Mettre à jour le catalogue", possible)) {
                 app.runner.Start(CatalogUpdate, CatalogCommand(state), state.layout.project);
@@ -439,10 +440,10 @@ void DrawHome(App& app, const env::Snapshot& state) {
         Mark catalogMark = state.catalog.present ? Mark::Ok : Mark::Bad;
         if (!state.catalog.present) strcpy_s(catalogue, "absent");
         else if (fresh.state == env::FreshState::Outdated) {
-            sprintf_s(catalogue, "%zu nouveaux objets à ajouter", fresh.missing);
+            sprintf_s(catalogue, language::Tr("%zu nouveaux objets à ajouter"), fresh.missing);
             catalogMark = Mark::Warn;
-        } else if (fresh.state == env::FreshState::UpToDate) sprintf_s(catalogue, "%zu objets · à jour", state.catalog.entries);
-        else sprintf_s(catalogue, "%zu objets · %s", state.catalog.entries, state.catalog.updated.c_str());
+        } else if (fresh.state == env::FreshState::UpToDate) sprintf_s(catalogue, language::Tr("%zu objets · à jour"), state.catalog.entries);
+        else sprintf_s(catalogue, language::Tr("%zu objets · %s"), state.catalog.entries, state.catalog.updated.c_str());
         Mark compatMark = Mark::Busy;
         const char* compatValue = u8"vérification…";
         switch (compat.state) {
@@ -626,17 +627,17 @@ void DrawJournal(App& app, const env::Snapshot& world) {
             ImGui::SetCursorPosY(150);
             const char* line1 = "Rien n'a encore été lancé";
             ImGui::PushFont(fonts().strong, metric::TextLead);
-            ImGui::SetCursorPosX((w - ImGui::CalcTextSize(line1).x) * 0.5f);
+            ImGui::SetCursorPosX((w - ImGui::CalcTextSize(language::Tr(line1)).x) * 0.5f);
             ImGui::PopFont();
             Label(fonts().strong, metric::TextLead, color::Text, line1);
             const char* line2 = "Chaque activation et chaque opération d'entretien écrit ici ce qu'elle a vraiment fait.";
             ImGui::PushFont(fonts().text, metric::TextSmall);
-            ImGui::SetCursorPosX((w - ImGui::CalcTextSize(line2).x) * 0.5f);
+            ImGui::SetCursorPosX((w - ImGui::CalcTextSize(language::Tr(line2)).x) * 0.5f);
             ImGui::PopFont();
             Small(color::Muted, line2);
             const char* line3 = "Le jeu tient son propre journal, dans C:\\Temp\\opencode.";
             ImGui::PushFont(fonts().text, metric::TextSmall);
-            ImGui::SetCursorPosX((w - ImGui::CalcTextSize(line3).x) * 0.5f);
+            ImGui::SetCursorPosX((w - ImGui::CalcTextSize(language::Tr(line3)).x) * 0.5f);
             ImGui::PopFont();
             Small(color::Faint, line3);
         }
@@ -691,7 +692,7 @@ void DrawJournal(App& app, const env::Snapshot& world) {
         Pill(mark, label);
         ImGui::SameLine(0, 12);
         char elapsed[48];
-        sprintf_s(elapsed, "%.0f s", app.runner.Seconds());
+        sprintf_s(elapsed, language::Tr("%.0f s"), app.runner.Seconds());
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3);
         Label(fonts().text, metric::TextSmall, color::Faint, elapsed);
         if (verdict) {
@@ -734,7 +735,7 @@ void DrawJournal(App& app, const env::Snapshot& world) {
         draw->AddRectFilled(min, ImVec2(min.x + w, min.y + 36), color::Fade(color::White, 0.02f), metric::CardRadius, ImDrawFlags_RoundCornersTop);
         draw->AddLine(ImVec2(min.x, min.y + 36), ImVec2(min.x + w, min.y + 36), color::Hairline);
         for (int i = 0; i < 3; ++i) draw->AddCircleFilled(ImVec2(min.x + 20 + i * 14, min.y + 18), 4, color::Raised, 12);
-        draw->AddText(fonts().strong, metric::TextTiny, ImVec2(min.x + 68, min.y + 11), color::Faint, "SORTIE");
+        draw->AddText(fonts().strong, metric::TextTiny, ImVec2(min.x + 68, min.y + 11), color::Faint, language::Tr("SORTIE"));
         if (app.runner.Busy()) SpinnerAt(draw, ImVec2(min.x + w - 22, min.y + 18), 6, color::Azure, 1.8f);
         ImGui::SetCursorPos(ImVec2(0, 37));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 14));
@@ -791,7 +792,7 @@ void DrawRail(App& app, const env::Snapshot& state) {
                                   ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 10);
         }
         draw->AddText(fonts().display, 24, ImVec2(at.x + 58, at.y - 1), color::Text, "Wardrobe");
-        draw->AddText(fonts().text, metric::TextTiny, ImVec2(at.x + 59, at.y + 25), color::Faint, u8"Cosmétiques Dota 2");
+        draw->AddText(fonts().text, metric::TextTiny, ImVec2(at.x + 59, at.y + 25), color::Faint, language::Tr(u8"Cosmétiques Dota 2"));
         ImGui::Dummy(ImVec2(railWidth - 32, mark));
     }
     Spacer(30);
@@ -805,6 +806,18 @@ void DrawRail(App& app, const env::Snapshot& state) {
     if (NavItem(icon::Tools, "Entretien", app.page == Page::Maintenance, Mark::Idle, false, width)) app.page = Page::Maintenance;
     // A job that ended while the user was elsewhere says so on the tab.
     if (NavItem(icon::Journal, "Journal", app.page == Page::Journal, jobMark, job != task::State::Idle, width)) app.page = Page::Journal;
+
+    Spacer(24);
+    Small(color::Muted, "Langue");
+    static bool saveFailed = false;
+    const bool chinese = language::Current() == language::Language::SimplifiedChinese;
+    const float languageWidth = (width - metric::Gap) * 0.5f;
+    if (SecondaryButton("Français", chinese ? nullptr : icon::Check, true, languageWidth) && chinese)
+        saveFailed = !language::Select(language::Language::French);
+    ImGui::SameLine(0, metric::Gap);
+    if (SecondaryButton("简体中文", chinese ? icon::Check : nullptr, true, languageWidth, 40, LanguageFont()) && !chinese)
+        saveFailed = !language::Select(language::Language::SimplifiedChinese);
+    if (saveFailed) Small(color::Bad, "Impossible d’enregistrer la langue.");
 
     // live status, at the foot of the rail
     ImGui::SetCursorPosY(height - 26 - 112);
@@ -965,6 +978,7 @@ void StyleWindowFrame(HWND window) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    language::Load();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     std::wstring capture;
@@ -987,7 +1001,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!CreateDevice(handle)) {
         ReleaseDevice();
         UnregisterClassW(window.lpszClassName, instance);
-        MessageBoxW(nullptr, L"Impossible d'initialiser l'affichage (DirectX 11).", L"Wardrobe", MB_ICONERROR);
+        MessageBoxW(nullptr, env::Widen(language::Tr("Impossible d'initialiser l'affichage (DirectX 11).")).c_str(), L"Wardrobe", MB_ICONERROR);
         return 1;
     }
     CreateBrandTexture();
@@ -998,7 +1012,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
-    ui::LoadFonts();
+    ui::LoadFonts(true);
+    auto fontLanguage = language::Current();
     ui::ApplyStyle();
     ImGui_ImplWin32_Init(handle);
     ImGui_ImplDX11_Init(g_device, g_context);
@@ -1035,6 +1050,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             }
         }
 
+        if (fontLanguage != language::Current()) {
+            ImGui_ImplDX11_InvalidateDeviceObjects();
+            ImGui::GetIO().Fonts->Clear();
+            ui::LoadFonts(true);
+            fontLanguage = language::Current();
+        }
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <string>
 #include "imgui.h"
+#include "language.h"
 #include "imgui_internal.h"
 
 // The visual system shared by Wardrobe and its installer.
@@ -98,7 +99,9 @@ inline Fonts& fonts() {
     return instance;
 }
 
-inline void LoadFonts() {
+inline ImFont*& LanguageFont() { static ImFont* value = nullptr; return value; }
+
+inline void LoadFonts(bool includeCjk = false) {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Flags |= ImFontAtlasFlags_NoMouseCursors;
     auto load = [&](std::initializer_list<const char*> files, float size) -> ImFont* {
@@ -114,18 +117,21 @@ inline void LoadFonts() {
         }
         return nullptr;
     };
+    const bool chinese = includeCjk && language::Current() == language::Language::SimplifiedChinese;
     Fonts& f = fonts();
-    f.text = load({"segoeui.ttf"}, metric::TextBody);
-    f.strong = load({"seguisb.ttf", "segoeuib.ttf"}, metric::TextBody);
-    f.bold = load({"segoeuib.ttf", "seguisb.ttf"}, metric::TextBody);
-    f.display = load({"bahnschrift.ttf", "segoeuib.ttf"}, metric::TextDisplay);
+    f.text = load(chinese ? std::initializer_list<const char*>{"msyh.ttc", "simhei.ttf", "segoeui.ttf"} : std::initializer_list<const char*>{"segoeui.ttf"}, metric::TextBody);
+    f.strong = load(chinese ? std::initializer_list<const char*>{"msyhbd.ttc", "msyh.ttc", "simhei.ttf"} : std::initializer_list<const char*>{"seguisb.ttf", "segoeuib.ttf"}, metric::TextBody);
+    f.bold = load(chinese ? std::initializer_list<const char*>{"msyhbd.ttc", "msyh.ttc", "simhei.ttf"} : std::initializer_list<const char*>{"segoeuib.ttf", "seguisb.ttf"}, metric::TextBody);
+    f.display = load(chinese ? std::initializer_list<const char*>{"msyhbd.ttc", "msyh.ttc", "simhei.ttf"} : std::initializer_list<const char*>{"bahnschrift.ttf", "segoeuib.ttf"}, metric::TextDisplay);
     f.icons = load({"SegoeIcons.ttf", "segmdl2.ttf"}, metric::TextBody);
-    f.mono = load({"CascadiaMono.ttf", "consola.ttf"}, metric::TextSmall);
+    f.mono = load(chinese ? std::initializer_list<const char*>{"simsun.ttc", "msyh.ttc", "consola.ttf"} : std::initializer_list<const char*>{"CascadiaMono.ttf", "consola.ttf"}, metric::TextSmall);
     if (!f.text) f.text = io.Fonts->AddFontDefault();
     if (!f.strong) f.strong = f.text;
     if (!f.bold) f.bold = f.strong;
     if (!f.display) f.display = f.bold;
     if (!f.mono) f.mono = f.text;
+    LanguageFont() = includeCjk && !chinese ? load({"msyhbd.ttc", "msyh.ttc", "simhei.ttf"}, metric::TextBody) : f.strong;
+    if (!LanguageFont()) LanguageFont() = f.strong;
     io.FontDefault = f.text;
 }
 
@@ -243,6 +249,7 @@ inline void Backdrop(ImDrawList* draw, ImVec2 min, ImVec2 max) {
 
 // ---------------------------------------------------------------- text
 inline void Label(ImFont* font, float size, ImU32 tint, const char* text) {
+    text = language::Tr(text);
     ImGui::PushFont(font, size);
     ImGui::PushStyleColor(ImGuiCol_Text, tint);
     ImGui::TextUnformatted(text);
@@ -250,6 +257,7 @@ inline void Label(ImFont* font, float size, ImU32 tint, const char* text) {
     ImGui::PopFont();
 }
 inline void Wrapped(ImFont* font, float size, ImU32 tint, const char* text, float wrapAt = 0) {
+    text = language::Tr(text);
     ImGui::PushFont(font, size);
     ImGui::PushStyleColor(ImGuiCol_Text, tint);
     ImGui::PushTextWrapPos(wrapAt > 0 ? ImGui::GetCursorPosX() + wrapAt : 0.0f);
@@ -360,6 +368,7 @@ inline void StatusOrb(Mark mark, float radius) {
 }
 
 inline void Pill(Mark mark, const char* label) {
+    label = language::Tr(label);
     ImGui::PushFont(fonts().strong, metric::TextTiny);
     const ImVec2 size = ImGui::CalcTextSize(label);
     ImGui::PopFont();
@@ -377,6 +386,8 @@ inline void Pill(Mark mark, const char* label) {
 
 // One fact about the machine: a tinted icon chip, what it is, what it says.
 inline void CheckTile(const char* id, const char* glyph, const char* label, const char* value, Mark mark, float width) {
+    label = language::Tr(label);
+    value = language::Tr(value);
     const float height = 58;
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::PushID(id);
@@ -395,8 +406,9 @@ inline void CheckTile(const char* id, const char* glyph, const char* label, cons
     const float textX = origin.x + 60, right = max.x - 16;
     draw->AddText(fonts().strong, metric::TextSmall, ImVec2(textX, origin.y + 11), color::Text, label);
     ImGui::PushFont(fonts().text, metric::TextSmall);
-    std::string shown = value;
-    while (shown.size() > 3 && ImGui::CalcTextSize(shown.c_str()).x > right - textX) shown = shown.substr(0, shown.size() - 4) + u8"…";
+    const auto shown = language::Ellipsize(value, [&](const std::string& text) {
+        return ImGui::CalcTextSize(text.c_str()).x <= right - textX;
+    });
     ImGui::PopFont();
     draw->AddText(fonts().text, metric::TextSmall, ImVec2(textX, origin.y + 30),
                   mark == Mark::Ok || mark == Mark::Idle ? color::Muted : tint, shown.c_str());
@@ -409,6 +421,8 @@ inline bool PrimaryButton(const char* label, const char* glyph, const char* hint
     if (height <= 0) height = hint && *hint ? 64.0f : 48.0f;
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(label, ImVec2(width, height));
+    label = language::Tr(label);
+    hint = language::Tr(hint);
     const bool hovered = enabled && ImGui::IsItemHovered();
     const bool held = hovered && ImGui::IsItemActive();
     const bool clicked = enabled && ImGui::IsItemDeactivated() && hovered;
@@ -454,14 +468,17 @@ inline bool PrimaryButton(const char* label, const char* glyph, const char* hint
 }
 
 // Everything else you can do: quiet until hovered.
-inline bool SecondaryButton(const char* label, const char* glyph, bool enabled, float width = 0, float height = 40) {
-    ImGui::PushFont(fonts().strong, metric::TextBody);
+inline bool SecondaryButton(const char* label, const char* glyph, bool enabled, float width = 0, float height = 40, ImFont* textFont = nullptr) {
+    if (!textFont) textFont = fonts().strong;
+    ImGui::PushFont(textFont, metric::TextBody);
+    const char* id = label;
+    label = language::Tr(label);
     const ImVec2 labelSize = ImGui::CalcTextSize(label);
     ImGui::PopFont();
     const float glyphW = glyph ? IconSize(glyph, 14).x + 9 : 0;
     if (width <= 0) width = labelSize.x + glyphW + 36;
     const ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton(label, ImVec2(width, height));
+    ImGui::InvisibleButton(id, ImVec2(width, height));
     const bool hovered = enabled && ImGui::IsItemHovered();
     const bool held = hovered && ImGui::IsItemActive();
     const bool clicked = enabled && ImGui::IsItemDeactivated() && hovered;
@@ -477,7 +494,7 @@ inline bool SecondaryButton(const char* label, const char* glyph, bool enabled, 
     const float startX = origin.x + (width - labelSize.x - glyphW) * 0.5f;
     if (glyph) IconAt(draw, ImVec2(startX + (glyphW - 9) * 0.5f, origin.y + height * 0.5f + 1), glyph, 14,
                       enabled ? color::Mix(color::Muted, color::AccentText, hover) : color::Faint);
-    draw->AddText(fonts().strong, metric::TextBody, ImVec2(startX + glyphW, origin.y + (height - labelSize.y) * 0.5f), ink, label);
+    draw->AddText(textFont, metric::TextBody, ImVec2(startX + glyphW, origin.y + (height - labelSize.y) * 0.5f), ink, label);
     if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
     return clicked;
 }
@@ -488,6 +505,7 @@ inline bool NavItem(const char* glyph, const char* label, bool active, Mark badg
     const float height = 44;
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(label, ImVec2(width, height));
+    label = language::Tr(label);
     const bool hovered = ImGui::IsItemHovered();
     const bool clicked = ImGui::IsItemDeactivated() && hovered;
     const float on = Approach(ImGui::GetItemID() + 1, active ? 1.0f : 0.0f, 12.0f);
@@ -536,6 +554,7 @@ inline void ProgressBar(const char* id, float fraction, float width, float heigh
 
 // A numbered step: the number chip beside its title, the sentence beneath.
 inline void StepCard(const char* id, int number, const char* title, const char* text, float width, float height) {
+    title = language::Tr(title);
     if (BeginPanel(id, ImVec2(width, height), ImVec2(18, 16))) {
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const ImVec2 origin = ImGui::GetCursorScreenPos();

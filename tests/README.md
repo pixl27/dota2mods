@@ -58,3 +58,8 @@ found by its signature, its call site or its schema declaration. Both runs must
 reproduce the recorded profile exactly. It reports SKIP instead of failing when
 Dota 2 is not installed on the machine, and accepts a path to any client.dll so a
 future build can be checked before shipping a profile for it.
+
+`language_test.cpp` is also run by `tests\run_tests.bat`. It checks the launcher
+translation catalog (unique keys and matching printf conversions), French
+fallback, Chinese labels, UTF-8 truncation, and language persistence in an
+isolated Unicode temporary path. It does not change the user's language file.

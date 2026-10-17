@@ -23,6 +23,15 @@ FIRST TIME (10 min, once):
    (create the folder if missing)
 
 USAGE (tout se fait depuis l'application):
+Le sélecteur « Langue » dans la barre latérale passe immédiatement du français
+au chinois simplifié. Le français reste la langue par défaut. Le choix est
+enregistré dans %LOCALAPPDATA%\Wardrobe\language.txt ; une valeur absente ou
+inconnue revient au français. Le français conserve ses polices existantes ; le
+chinois utilise Microsoft YaHei (ou une police système de repli), avec SimSun
+pour le journal. Les polices sont rechargées entre deux images lors du changement.
+Cette traduction couvre le lanceur ; l'installateur, le panneau en jeu et la
+sortie brute des outils restent inchangés.
+
 1. Lance build\Wardrobe.exe. Pas d'admin, pas d'installation.
 2. L'ecran d'accueil dit ou en est chaque element et propose la seule action
    utile du moment : lancer Dota 2, puis activer Wardrobe.
